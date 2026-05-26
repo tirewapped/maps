@@ -152,7 +152,24 @@ static bool decodeJpg(const char* path, uint16_t* px) {
     esp_jpeg_image_output_t out = {};
     esp_err_t e = esp_jpeg_decode(&cfg, &out);
     free(jbuf);
-    return e == ESP_OK;
+    if (e != ESP_OK) {
+        /* The file exists and was read fine, but the decoder rejected it — without
+         * this, that looks identical to "no tiles for this area". esp_jpeg
+         * (TJpgDec) decodes baseline JPEG only: progressive / arithmetic-coded /
+         * CMYK / 12-bit tiles fail here. Throttled, because a screenful of bad
+         * tiles is retried every GPS update (decode failures aren't cached). */
+        static bool     warned = false;
+        static uint32_t lastMs = 0;
+        uint32_t now = millis();
+        if (!warned || now - lastMs > 30000) {
+            warn("%s: JPEG decode failed (%s) — esp_jpeg/TJpgDec is baseline-only "
+                 "(progressive/arithmetic/CMYK/12-bit rejected); re-encode tiles as "
+                 "baseline JPEG\n", path, esp_err_to_name(e));
+            warned = true; lastMs = now;
+        }
+        return false;
+    }
+    return true;
 }
 
 /* Load (z,x,y) into the cache: tries <z>/<x>/<y>.jpg (decoded), then .bin (raw).
@@ -278,10 +295,20 @@ static void composite(void* arg) {
     }
 
     const char* msg = nullptr;
-    if      (c->state == MAPS_NOSD)  msg = "No SD card";
-    else if (c->state == MAPS_NOFIX) msg = "Waiting for GPS...";
-    else if (c->state == MAPS_NOTILES || (c->state == MAPS_OK && present == 0))
-                                     msg = "No tiles here\n(copy to /sdcard/maps)";
+    char nofix[112];
+    if (c->state == MAPS_NOSD) {
+        msg = "No SD card";
+    } else if (c->state == MAPS_NOFIX) {
+        /* Acquisition screen: nudge the user to improve the sky view, with the live
+         * satellite count + best signal so progress toward a fix is visible. */
+        snprintf(nofix, sizeof nofix,
+                 "Make the device see more of the sky\n\n"
+                 "Satellites seen: %d\nSignal to noise: %d",
+                 storageGetInt("gps.sats_view", 0), storageGetInt("gps.snr", 0));
+        msg = nofix;
+    } else if (c->state == MAPS_NOTILES || (c->state == MAPS_OK && present == 0)) {
+        msg = "No tiles here\n(copy to /sdcard/maps)";
+    }
     if (s_label) {
         if (msg) { lv_label_set_text(s_label, msg); lv_obj_clear_flag(s_label, LV_OBJ_FLAG_HIDDEN); }
         else     { lv_obj_add_flag(s_label, LV_OBJ_FLAG_HIDDEN); }
@@ -373,8 +400,13 @@ static void onChange(const char* /*k*/, const char* /*v*/) { wakeWorker(); }
 static void mapsWorker(void*) {
     info("task up");
     itsClientInit(2);
-    storageSubscribeChanges("gps",    onChange);   /* centre */
-    storageSubscribeChanges("s.maps", onChange);   /* zoom / tiledir */
+    /* Only the fix position re-centres the map. Subscribing to the whole "gps"
+     * scope pulled in the ~1 Hz telemetry churn (sats/snr/dop/utc/fix_age) too,
+     * which overflowed this worker's inbox while it was busy reading SD tiles —
+     * a "notify drop" warn storm. lat/lon are all rebuild() actually reads. */
+    storageSubscribeChanges("gps.lat", onChange);  /* centre */
+    storageSubscribeChanges("gps.lon", onChange);
+    storageSubscribeChanges("s.maps",  onChange);  /* zoom / tiledir */
     for (;;) {
         if (s_dirty) { s_dirty = false; rebuild(); }
         itsPoll(portMAX_DELAY);
@@ -475,11 +507,12 @@ static void mapsApp(void* arg) {
 
     s_label = lv_label_create(layer);
     lv_label_set_text(s_label, "Waiting for GPS...");
+    lv_obj_set_style_text_align(s_label, LV_TEXT_ALIGN_CENTER, 0);   /* multi-line status reads centred */
     lv_obj_center(s_label);
 
     /* "centre me" button (re-lock to GPS) */
     lv_obj_t* btn = lv_button_create(layer);
-    lv_obj_set_size(btn, 44, 44);
+    lv_obj_set_size(btn, 26, 26);   /* ~60% of the old 44px */
     lv_obj_align(btn, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
     lv_obj_add_event_cb(btn, mapCenterCb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* bl = lv_label_create(btn);
