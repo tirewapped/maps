@@ -5,7 +5,7 @@
 **maps** is an offline RGB565 slippy-map viewer for spangap LCD devices:
 an LCD launcher program that blits pre-baked map tiles read from SD,
 centred on the live GPS fix. Independent of the RNS family — published
-under `reticulous/` for discoverability, but any LCD app-straddle can
+under `reticulous/` for discoverability, but any LCD buildable straddle can
 consume it. Doubles as the docs' "first non-RNS feature straddle"
 walkthrough.
 
@@ -35,7 +35,7 @@ demand and cached in PSRAM by the maps worker task.
 
 GPS fix is read via **ephemeral `gps.*` storage keys** — there is no
 compile-time GPS dependency. The GNSS chip can live in the consuming
-app-straddle (today: in reticulous-tdeck's `gps.cpp`) until a GPS
+buildable straddle (today: in reticulous-tdeck's `gps.cpp`) until a GPS
 service abstraction earns its own straddle.
 
 ## Dependencies
