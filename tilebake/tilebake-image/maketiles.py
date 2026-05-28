@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-maketiles.py — build offline map tiles for the diptych 'maps' app.
+maketiles.py — build offline map tiles for the spangap 'maps' app.
 
 The on-device 'maps' viewer (reticulous/main/maps.cpp) reads tiles straight off
 the SD card. Two on-card formats, both 256x256:
@@ -96,7 +96,7 @@ def load_tile(src, z, x, y, ua, delay):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build offline map tiles for the diptych 'maps' app.")
+    ap = argparse.ArgumentParser(description="Build offline map tiles for the spangap 'maps' app.")
     ap.add_argument("--src", required=True,
                     help="local z/x/y tile dir, OR a URL template '.../{z}/{x}/{y}.png' (your own server)")
     ap.add_argument("--out", required=True, help="output dir (copy its contents to SD /sdcard/maps)")
@@ -108,7 +108,7 @@ def main():
     fmt.add_argument("--bin", dest="fmt", action="store_const", const="bin", help="raw RGB565 tiles")
     ap.set_defaults(fmt="jpg")
     ap.add_argument("--quality", type=int, default=80, help="JPEG quality (default 80)")
-    ap.add_argument("--ua", default="diptych-maketiles/1.0", help="HTTP User-Agent for --src URL mode")
+    ap.add_argument("--ua", default="spangap-maketiles/1.0", help="HTTP User-Agent for --src URL mode")
     ap.add_argument("--delay", type=float, default=0.1, help="seconds between fetches in URL mode")
     args = ap.parse_args()
 

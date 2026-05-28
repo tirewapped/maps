@@ -1,0 +1,24 @@
+# maps — offline RGB565 slippy-map viewer (LCD + browser).
+#
+# An LCD launcher program that blits pre-baked RGB565 tiles read from SD
+# (default /sdcard/maps/<z>/<x>/<y>.bin) centred on the live GPS fix.
+# Reads the fix via ephemeral gps.* keys — no compile-time GPS dep, so
+# the GNSS chip can live in the consuming app-straddle (reticulous-tdeck)
+# until a GPS service abstraction earns its own straddle.
+#
+# Independent of the RNS family — published under `reticulous/` for
+# discoverability, but any LCD app-straddle can consume it. Doubles as
+# the docs' "first non-RNS feature straddle" walkthrough.
+#
+# Tooling: scripts/maketiles.py runs on a workstation to bake tiles into
+# the device's SD format. Never on the device.
+schema_version: 1
+name: reticulous/maps
+prefix: maps
+version: 0.1.0
+firmware: esp-idf
+browser: browser
+platforms: [idf]
+requires:
+  - spangap/spangap-core
+  - spangap/spangap-lcd

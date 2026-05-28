@@ -30,9 +30,9 @@
  * Ephemeral: maps.state   ("ready" | "no tiles" | "no fix" | "no sd")
  */
 #include "maps.h"
-#include "diptych.h"
+#include "spangap.h"
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
 
 #include "lcd.h"          /* pulls in lvgl.h */
 #include "fs.h"
@@ -570,7 +570,7 @@ void mapsLcdRegister(void) {
     lcdRegisterSettings("Maps", "Maps", mapsSettingsPane);
 }
 
-#else  /* !CONFIG_DIPTYCH_LCD — no display, no map */
+#else  /* !CONFIG_SPANGAP_LCD — no display, no map */
 
 void mapsInit(void)        {}
 void mapsLcdRegister(void) {}
