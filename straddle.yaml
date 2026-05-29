@@ -21,4 +21,8 @@ browser: browser
 platforms: [idf]
 requires:
   - spangap/spangap-core
+optional_requires:
+  # The whole maps program is the LCD viewer — maps.cpp is wrapped in
+  # #if CONFIG_SPANGAP_LCD with a no-op #else arm. With --no-lcd, maps
+  # stages but compiles to nothing.
   - spangap/spangap-lcd
