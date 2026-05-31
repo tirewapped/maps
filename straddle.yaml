@@ -26,3 +26,11 @@ optional_requires:
   # #if CONFIG_SPANGAP_LCD with a no-op #else arm. With --no-lcd, maps
   # stages but compiles to nothing.
   - spangap/spangap-lcd
+# Auto-init: folded into the buildable's generated spangapInitStraddles().
+# mapsInit() sets storage defaults, registers a CLI verb, spawns the render
+# worker, and self-registers its LCD launcher program + Settings pane (the lcd
+# task reads those registries lazily, so registering before lcdInit is fine).
+# GPS position arrives via storageSubscribeChanges on gps.lat/gps.lon —
+# event-driven, no ordering dependency on any GNSS init. Default order (100).
+init:
+  - call: mapsInit

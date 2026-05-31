@@ -563,16 +563,19 @@ void mapsInit(void) {
     s_mux = xSemaphoreCreateMutex();
     cliRegisterCmd("maps", cliMaps);
     s_worker = spawnTask(mapsWorker, TAG, 8192, nullptr, 1, 1, STACK_PSRAM);
-}
 
-void mapsLcdRegister(void) {
+    /* Self-register the launcher program + Settings pane. Both push into
+     * registries the lcd task reads lazily (lcdRegisterSettings is documented
+     * safe from any init task; the launcher entry is read when the grid is
+     * built, on the lcd task after lcdInit), so registering here — from
+     * spangapInitStraddles(), before lcdInit — is fine. Folding this into
+     * mapsInit() is what lets the consumer's main.cpp reference maps nowhere. */
     lcdRegister("Maps", "maps", mapsApp);
     lcdRegisterSettings("Maps", "Maps", mapsSettingsPane);
 }
 
 #else  /* !CONFIG_SPANGAP_LCD — no display, no map */
 
-void mapsInit(void)        {}
-void mapsLcdRegister(void) {}
+void mapsInit(void) {}
 
 #endif
