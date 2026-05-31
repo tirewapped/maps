@@ -3,7 +3,7 @@
 # An LCD launcher program that blits pre-baked RGB565 tiles read from SD
 # (default /sdcard/maps/<z>/<x>/<y>.bin) centred on the live GPS fix.
 # Reads the fix via ephemeral gps.* keys — no compile-time GPS dep, so
-# the GNSS chip can live in the consuming buildable straddle (reticulous-tdeck)
+# the GNSS chip can live in the consuming buildable straddle (hw-tdeck)
 # until a GPS service abstraction earns its own straddle.
 #
 # Independent of the RNS family — published under `reticulous/` for

@@ -527,9 +527,10 @@ static void mapsApp(void* arg) {
 /* ─────────────── CLI + settings ─────────────── */
 
 static void cliMaps(const char* args) {
-    if (args && strcmp(args, "help") == 0) {
-        cliPrintf("  %-*s map status\n",        CLI_HELP_COL, "maps");
-        cliPrintf("  %-*s recentre on GPS\n",   CLI_HELP_COL, "maps center");
+    if (args && strcmp(args, "help") == 0) { cliPrintf("%-*s map status; center to recentre on GPS\n", CLI_HELP_COL, "maps [center]"); return; }
+    if (args && cliWantsHelp(args)) {
+        cliPrintf("%-*s map status\n",        CLI_HELP_COL, "maps");
+        cliPrintf("%-*s recentre on GPS\n",   CLI_HELP_COL, "maps center");
         return;
     }
     if (args && strcmp(args, "center") == 0) { mapCenterCb(nullptr); cliPrintf("recentred\n"); return; }

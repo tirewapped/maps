@@ -23,7 +23,7 @@ the 3×3 grid around the current centre while the LCD task animates.
 ## GPS as ephemeral storage
 
 The map reads ephemeral `gps.*` keys (no `s.` prefix; lost on reboot,
-synced live). Today the keys are written by reticulous-tdeck's
+synced live). Today the keys are written by hw-tdeck's
 `gps.cpp`. Any future "GPS service" abstraction just needs to write
 the same keys for the maps straddle to keep working.
 

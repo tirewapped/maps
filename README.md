@@ -35,7 +35,7 @@ demand and cached in PSRAM by the maps worker task.
 
 GPS fix is read via **ephemeral `gps.*` storage keys** — there is no
 compile-time GPS dependency. The GNSS chip can live in the consuming
-buildable straddle (today: in reticulous-tdeck's `gps.cpp`) until a GPS
+buildable straddle (today: in hw-tdeck's `gps.cpp`) until a GPS
 service abstraction earns its own straddle.
 
 ## Dependencies
@@ -58,4 +58,4 @@ picks it up.
 - [INTERNALS.md](INTERNALS.md) — tile format, worker/lcd split,
   slippy-map math, cache policy.
 - The consuming-app doc:
-  [docs/maps.md](../reticulous-tdeck/docs/maps.md).
+  [docs/maps.md](../hw-tdeck/docs/maps.md).
