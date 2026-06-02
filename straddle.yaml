@@ -31,6 +31,10 @@ optional_requires:
 # worker, and self-registers its LCD launcher program + Settings pane (the lcd
 # task reads those registries lazily, so registering before lcdInit is fine).
 # GPS position arrives via storageSubscribeChanges on gps.lat/gps.lon —
-# event-driven, no ordering dependency on any GNSS init. Default order (100).
+# event-driven, no ordering dependency on any GNSS init. But the launcher
+# registration (lcdRegister) is NOT lazy: it posts to the lcd task and bails
+# if that task doesn't exist yet, so mapsInit must run AFTER lcdInit (order
+# 150). order: 180 matches the other launcher straddles (lxmf, nomad).
 init:
   - call: mapsInit
+    order: 180
