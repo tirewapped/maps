@@ -21,17 +21,21 @@ browser: browser
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
 optional_requires:
-  # The whole maps program is the LCD viewer — maps.cpp is wrapped in
-  # #if CONFIG_SPANGAP_LCD with a no-op #else arm. With --no-lcd, maps
-  # stages but compiles to nothing.
+  # The whole maps program is the LCD viewer — its source lives in the
+  # esp-idf/conditional/spangap-lcd/ slice, compiled only when spangap-lcd is
+  # staged. With --no-lcd, maps stages but its viewer compiles to nothing and
+  # the mapsLcdRegister hook is simply not called.
   - spangap/spangap-lcd
 # Auto-init: folded into the buildable's generated spangapInitStraddles().
-# mapsInit() sets storage defaults, registers a CLI verb, spawns the render
-# worker, and self-registers its LCD launcher program + Settings pane. The
-# launcher registration (lcdRegister) is NOT lazy — it posts to the lcd task and
-# bails if that task doesn't exist yet — but the platform band brings lcd up
-# before the straddle band, so by the time mapsInit runs the lcd task is
-# guaranteed live. (GPS position arrives via storageSubscribeChanges on
-# gps.lat/gps.lon — event-driven, no ordering dependency on any GNSS init.)
+# mapsInit() is a no-op; mapsLcdRegister() (the when:-gated hook below) sets
+# storage defaults, registers a CLI verb, spawns the render worker, and
+# self-registers the LCD launcher program + Settings pane. The launcher
+# registration (lcdRegister) is NOT lazy — it posts to the lcd task and bails if
+# that task doesn't exist yet — but the platform band brings lcd up before the
+# straddle band, so by the time the hook runs the lcd task is guaranteed live.
+# (GPS position arrives via storageSubscribeChanges on gps.lat/gps.lon —
+# event-driven, no ordering dependency on any GNSS init.)
 init:
   - call: mapsInit
+  - call: mapsLcdRegister
+    when: spangap/spangap-lcd
