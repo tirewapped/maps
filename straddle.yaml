@@ -20,12 +20,6 @@ firmware: esp-idf
 browser: browser
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
-optional_requires:
-  # The whole maps program is the LCD viewer — its source lives in the
-  # esp-idf/conditional/spangap-lcd/ slice, compiled only when spangap-lcd is
-  # staged. With --no-lcd, maps stages but its viewer compiles to nothing and
-  # the mapsLcdRegister hook is simply not called.
-  - spangap/spangap-lcd
 # Auto-init: folded into the buildable's generated spangapInitStraddles().
 # mapsInit() is a no-op; mapsLcdRegister() (the when:-gated hook below) sets
 # storage defaults, registers a CLI verb, spawns the render worker, and
