@@ -26,3 +26,9 @@ staging/
 
 # Build artifacts (spangap-generated)
 esp-idf/build/
+
+# tilebake: local source extracts, baked output, planetiler's source cache
+*.osm.pbf
+pbf/
+out/
+.tilebake-cache/

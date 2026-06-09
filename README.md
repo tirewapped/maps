@@ -45,10 +45,32 @@ service abstraction earns its own straddle.
 
 ## Tile baking
 
-Tiles are baked on a workstation, not the device. `scripts/maketiles.py`
-takes a list of `(z, x, y)` ranges and a source basemap (raster or
-vector) and produces the binary `/<z>/<x>/<y>.bin` tree the device
-reads.
+Tiles are baked on a workstation, not the device. There are two entry
+points, depending on what you already have:
+
+**You have rendered raster tiles (a `z/x/y` tree or your own tile
+server URL):** use `scripts/maketiles.py` directly. It takes a bbox and
+zoom range and produces the `/<z>/<x>/<y>.{jpg,bin}` tree the device
+reads. It is *not* a renderer — it will not turn an `.osm.pbf` into
+tiles, and it refuses to scrape `tile.openstreetmap.org`.
+
+**You only have raw OSM data (an `.osm.pbf` extract, e.g. from
+Geofabrik):** use `scripts/tilebake.sh`. It builds and runs a single
+container that does the whole chain — renders the pbf to vector tiles
+(planetiler), rasterises them through an internal tileserver-gl, and
+bakes the device tree via `maketiles.py` — so all you supply is the
+pbf, a bbox and a zoom range:
+
+```
+./scripts/tilebake.sh --pbf berlin-latest.osm.pbf --out ./out \
+    --bbox 13.10 52.35 13.75 52.60 --zoom 10 16
+```
+
+Needs Docker. The first run downloads planetiler's global source data
+(water polygons, natural earth — ~1 GB) into `./.tilebake-cache`;
+subsequent runs reuse it and are offline. See
+[tilebake/](scripts/tilebake/) for the image and the in-container
+orchestrator.
 
 Copy the resulting tree to your SD card under `maps/` and the device
 picks it up.
