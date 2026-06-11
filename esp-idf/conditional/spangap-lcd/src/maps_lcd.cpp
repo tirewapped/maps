@@ -80,6 +80,7 @@ static bool   s_follow = true;
 static portMUX_TYPE s_ctrlMux = portMUX_INITIALIZER_UNLOCKED;
 static long         s_panDx = 0, s_panDy = 0;   /* accumulated drag, screen px */
 static bool         s_recenter = false;
+static int          s_zoomReq  = 0;             /* accumulated +/- button steps */
 
 /* ─────────────── lcd-task-owned widgets (set in mapsApp) ─────────────── */
 
@@ -88,6 +89,11 @@ static lv_obj_t* s_label     = nullptr;
 static uint16_t* s_canvasBuf = nullptr;
 static int       s_W = 0, s_H = 0;       /* canvas size, px */
 static int       s_stridePx  = 0;        /* row pitch, uint16 units */
+
+/* rounded zoom-level pill, flashed for 2s whenever the effective zoom changes */
+static lv_obj_t*   s_zoomWidget    = nullptr;
+static lv_obj_t*   s_zoomLabel     = nullptr;
+static lv_timer_t* s_zoomHideTimer = nullptr;
 
 /* ─────────────── tile cache (shared, guarded by s_mux) ─────────────── */
 
@@ -98,7 +104,7 @@ static uint32_t          s_lruClock = 0;
 
 /* composite request, heap-passed to the lcd task */
 enum { MAPS_OK = 0, MAPS_NOFIX, MAPS_NOTILES, MAPS_NOSD };
-struct Composite { long tlx, tly; int z; int state; long markerX, markerY; bool haveFix; };
+struct Composite { long tlx, tly; int z; int state; long markerX, markerY; bool haveFix; bool zoomChanged; };
 
 /* ─────────────── slippy-map math ─────────────── */
 
@@ -214,6 +220,25 @@ static bool ensureCell(const char* dir, int z, int x, int y) {
     return false;
 }
 
+/* Is there a *real* (non-overzoom) tile at zoom z for the tile under (lat,lon)?
+ * A cache hit proves it exists; otherwise stat the .jpg/.bin on SD. This is what
+ * caps zoom to where we actually have data (overzoom ancestors don't count). */
+static bool realTileAt(const char* dir, int z, double lat, double lon) {
+    if (z < ZOOM_MIN || z > ZOOM_MAX) return false;
+    double gx, gy;
+    lonlatToGlobalPx(lon, lat, z, &gx, &gy);
+    int n  = 1 << z;
+    int tx = (int)floor(gx / TILE), ty = (int)floor(gy / TILE);
+    if (tx < 0 || ty < 0 || tx >= n || ty >= n) return false;
+    if (tileInCache(z, tx, ty)) return true;
+    char path[192]; struct stat st;
+    snprintf(path, sizeof path, "%s/%d/%d/%d.jpg", dir, z, tx, ty);
+    if (fs_stat(path, &st) == 0 && st.st_size > 0) return true;
+    snprintf(path, sizeof path, "%s/%d/%d/%d.bin", dir, z, tx, ty);
+    if (fs_stat(path, &st) == 0 && st.st_size > 0) return true;
+    return false;
+}
+
 /* ─────────────── compositing (lcd task) ─────────────── */
 
 static inline void putPx(int x, int y, uint16_t c) {
@@ -252,6 +277,27 @@ static void drawMarker(int cx, int cy) {
             if (d2 <= 25) putPx(cx + dx, cy + dy, 0xFFFF);
             if (d2 <= 9)  putPx(cx + dx, cy + dy, 0xF800);
         }
+}
+
+/* Rounded zoom-level pill (lcd task). Shown for 2s on any effective-zoom change
+ * — +/- buttons, pinch, or auto zoom-out on leaving coverage — then hidden by a
+ * one-shot timer. A repeat change just restarts the 2s window. */
+static void zoomHideCb(lv_timer_t* /*t*/) {
+    if (s_zoomWidget) lv_obj_add_flag(s_zoomWidget, LV_OBJ_FLAG_HIDDEN);
+    s_zoomHideTimer = nullptr;   /* one-shot: LVGL frees it after this fires */
+}
+static void showZoomIndicator(int z) {
+    if (!s_zoomWidget || !s_zoomLabel) return;
+    char buf[12];
+    snprintf(buf, sizeof buf, "z%d", z);
+    lv_label_set_text(s_zoomLabel, buf);
+    lv_obj_clear_flag(s_zoomWidget, LV_OBJ_FLAG_HIDDEN);
+    if (s_zoomHideTimer) {
+        lv_timer_reset(s_zoomHideTimer);
+    } else {
+        s_zoomHideTimer = lv_timer_create(zoomHideCb, 2000, nullptr);
+        lv_timer_set_repeat_count(s_zoomHideTimer, 1);
+    }
 }
 
 static void composite(void* arg) {
@@ -316,6 +362,8 @@ static void composite(void* arg) {
         else     { lv_obj_add_flag(s_label, LV_OBJ_FLAG_HIDDEN); }
     }
 
+    if (c->zoomChanged) showZoomIndicator(c->z);
+
     lv_obj_invalidate(s_canvas);
     free(c);
 }
@@ -325,9 +373,9 @@ static void composite(void* arg) {
 static void rebuild(void) {
     if (!s_open) return;   /* program not on screen yet — nothing to draw */
 
-    int zoom = storageGetInt("s.maps.zoom", 15);
-    if (zoom < ZOOM_MIN) zoom = ZOOM_MIN;
-    if (zoom > ZOOM_MAX) zoom = ZOOM_MAX;
+    int base = storageGetInt("s.maps.zoom", 15);
+    if (base < ZOOM_MIN) base = ZOOM_MIN;
+    if (base > ZOOM_MAX) base = ZOOM_MAX;
     std::string dir = storageGetStr("s.maps.tiledir", "/sdcard/maps");
 
     std::string la = storageGetStr("gps.lat", "");
@@ -339,11 +387,12 @@ static void rebuild(void) {
         s_haveCenter = true;
     }
 
-    /* consume pan / recentre from the lcd task */
-    long dx, dy; bool recenter;
+    /* consume pan / recentre / zoom-step from the lcd task */
+    long dx, dy; bool recenter; int zoomReq;
     portENTER_CRITICAL(&s_ctrlMux);
     dx = s_panDx; dy = s_panDy; s_panDx = 0; s_panDy = 0;
     recenter = s_recenter; s_recenter = false;
+    zoomReq = s_zoomReq; s_zoomReq = 0;
     portEXIT_CRITICAL(&s_ctrlMux);
     if (recenter)            s_follow = true;
     if ((dx || dy) && s_haveView) s_follow = false;
@@ -351,20 +400,40 @@ static void rebuild(void) {
     Composite* c = (Composite*)malloc(sizeof(Composite));
     if (!c) return;
     *c = {};
-    c->z = zoom; c->markerX = -1; c->markerY = -1; c->haveFix = fix;
+    c->z = base; c->markerX = -1; c->markerY = -1; c->haveFix = fix;
 
     if (!sdAvailable()) { c->state = MAPS_NOSD;  storageSet("maps.state", "no sd");  lcdRun(composite, c); return; }
     if (!s_haveCenter)  { c->state = MAPS_NOFIX; storageSet("maps.state", "no fix"); lcdRun(composite, c); return; }
 
-    /* view centre: GPS when following, else free-panned */
+    /* view centre: GPS when following, else free-panned (pan is in old-zoom px) */
     if (s_follow) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
     else if (dx || dy) {
         double gx, gy;
-        lonlatToGlobalPx(s_viewLon, s_viewLat, zoom, &gx, &gy);
+        lonlatToGlobalPx(s_viewLon, s_viewLat, base, &gx, &gy);
         gx -= dx; gy -= dy;     /* drag the map under the finger */
-        globalPxToLonLat(gx, gy, zoom, &s_viewLon, &s_viewLat);
+        globalPxToLonLat(gx, gy, base, &s_viewLon, &s_viewLat);
     }
     if (!s_haveView) { s_viewLat = s_lat; s_viewLon = s_lon; s_haveView = true; }
+
+    /* Effective zoom, capped to where we actually have tiles around the view.
+     * A +/- button step or pinch sets the desired level (base + request); we
+     * never zoom IN past the deepest real tile here, and if we've drifted out of
+     * coverage at the current level we drop down until a real tile reappears.
+     * The capped level is persisted so the slider, the indicator and the next
+     * rebuild all agree on it. */
+    int zoom = base + zoomReq;
+    if (zoom < ZOOM_MIN) zoom = ZOOM_MIN;
+    if (zoom > ZOOM_MAX) zoom = ZOOM_MAX;
+    while (zoom > base     && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
+    while (zoom > ZOOM_MIN && !realTileAt(dir.c_str(), zoom, s_viewLat, s_viewLon)) zoom--;
+    if (zoom != base) storageSet("s.maps.zoom", zoom);
+
+    /* Flash the zoom pill only when the level actually changed since last draw
+     * (the -1 sentinel suppresses a flash on the first render after opening). */
+    static int s_renderedZoom = -1;
+    c->z = zoom;
+    c->zoomChanged = (s_renderedZoom != -1 && s_renderedZoom != zoom);
+    s_renderedZoom = zoom;
 
     double vgx, vgy;
     lonlatToGlobalPx(s_viewLon, s_viewLat, zoom, &vgx, &vgy);
@@ -438,6 +507,21 @@ static void mapCenterCb(lv_event_t* /*e*/) {
     wakeWorker();
 }
 
+/* +/- zoom buttons: post a step to the worker, which applies it capped to the
+ * tiles available around the current view (see rebuild). */
+static void mapZoomInCb(lv_event_t* /*e*/) {
+    portENTER_CRITICAL(&s_ctrlMux);
+    s_zoomReq += 1;
+    portEXIT_CRITICAL(&s_ctrlMux);
+    wakeWorker();
+}
+static void mapZoomOutCb(lv_event_t* /*e*/) {
+    portENTER_CRITICAL(&s_ctrlMux);
+    s_zoomReq -= 1;
+    portEXIT_CRITICAL(&s_ctrlMux);
+    wakeWorker();
+}
+
 /* Pinch-to-zoom (lcd task, via the lcd gesture callback). Two fingers: live-
  * scale the canvas for feedback; on release step s.maps.zoom by the nearest
  * power-of-two of the pinch ratio. The worker then refetches at the new integer
@@ -482,6 +566,21 @@ static void mapsGesture(const lcd_touch_pt_t* pts, int count) {
 
 /* ─────────────── launcher program (lcd task) ─────────────── */
 
+/* A white-background control button, same size/shape/corner as the centre-me
+ * button, aligned to the bottom-left with the given vertical offset. */
+static lv_obj_t* makeGreyBtn(lv_obj_t* parent, const char* label, int yoff, lv_event_cb_t cb) {
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, 26, 26);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_LEFT, 8, yoff);
+    lv_obj_set_style_bg_color(b, lv_color_white(), 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, label);
+    lv_obj_set_style_text_color(l, lv_color_black(), 0);   /* dark glyph stays legible on white */
+    lv_obj_center(l);
+    return b;
+}
+
 static void mapsApp(void* arg) {
     lv_obj_t* layer = (lv_obj_t*)arg;
     storageSet("tdeck.multi_touch", 1);   /* we want pinch gestures while open */
@@ -520,6 +619,30 @@ static void mapsApp(void* arg) {
     lv_obj_t* bl = lv_label_create(btn);
     lv_label_set_text(bl, LV_SYMBOL_GPS);
     lv_obj_center(bl);
+
+    /* zoom +/- buttons, stacked in the bottom-left ('+' above '-'). The worker
+     * caps the step to the tiles actually present around the view. */
+    makeGreyBtn(layer, "+", -40, mapZoomInCb);
+    makeGreyBtn(layer, "-", -8,  mapZoomOutCb);
+
+    /* rounded zoom-level pill above the buttons, hidden until a zoom change */
+    s_zoomWidget = lv_obj_create(layer);
+    lv_obj_remove_style_all(s_zoomWidget);
+    lv_obj_set_size(s_zoomWidget, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_zoomWidget, lv_color_hex(0x303030), 0);
+    lv_obj_set_style_bg_opa(s_zoomWidget, LV_OPA_80, 0);
+    lv_obj_set_style_radius(s_zoomWidget, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_left(s_zoomWidget, 10, 0);
+    lv_obj_set_style_pad_right(s_zoomWidget, 10, 0);
+    lv_obj_set_style_pad_top(s_zoomWidget, 4, 0);
+    lv_obj_set_style_pad_bottom(s_zoomWidget, 4, 0);
+    lv_obj_clear_flag(s_zoomWidget, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(s_zoomWidget, LV_ALIGN_BOTTOM_LEFT, 8, -74);
+    s_zoomLabel = lv_label_create(s_zoomWidget);
+    lv_obj_set_style_text_color(s_zoomLabel, lv_color_white(), 0);
+    lv_label_set_text(s_zoomLabel, "z15");
+    lv_obj_center(s_zoomLabel);
+    lv_obj_add_flag(s_zoomWidget, LV_OBJ_FLAG_HIDDEN);
 
     lcdTouchAddGestureHandler(mapsGesture);   /* pinch-to-zoom */
 
@@ -572,6 +695,9 @@ void mapsLcdRegister(void) {
         storageDefault("s.maps.tiledir", "/sdcard/maps");
         storageSet("s.maps.version", MAPS_VERSION);
     }
+    /* GPS is the board's call, not ours: hw-tdeck defaults s.gps.enable on (it
+     * has the hardware), and the user owns it thereafter. Forcing it on at every
+     * maps init clobbered that choice on every boot. */
     s_mux = xSemaphoreCreateMutex();
     cliRegisterCmd("maps", cliMaps);
     s_worker = spawnTask(mapsWorker, TAG, 8192, nullptr, 1, 1, STACK_PSRAM);

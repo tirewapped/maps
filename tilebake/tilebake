@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# tilebake — turn OSM .pbf extracts into the device map-tile tree the 'maps'
+# app reads off SD. The whole chain (planetiler -> tileserver-gl -> maketiles.py)
+# runs inside one container; the tile server lives entirely internal to it.
+#
+# Two ways to run:
+#
+#   1. Batch (zero-config) — the default. Make zoom-named subdirs of ./pbf,
+#      then run with just --out. A folder names the zoom CEILING of the map it
+#      holds (a bare <zmax>); deeper maps overlay shallower ones:
+#
+#          pbf/7/                       (empty  -> whole world from Natural Earth)
+#          pbf/13/germany.osm.pbf
+#          pbf/16/berlin.osm.pbf
+#          ./tilebake --out ./tiles
+#
+#      Each map is rendered once into its own cache (.tilebake-cache/render/<dir>,
+#      a full z0..ceiling tree) and re-rendered only when its source or the
+#      pipeline changes — so re-runs skip maps you haven't touched. --out is then
+#      rebuilt from the caches, coarsest ceiling first: the shallowest map fills
+#      everything, and each deeper map overlays only the tiles that fall FULLY
+#      inside its bbox. So detail wins where the extract actually covers (real
+#      OSM roads, not the world fill's Natural-Earth land/water), while bbox-edge
+#      and too-zoomed-out tiles drop and the coarser layer shows through instead
+#      of a half-blank tile. The bbox is read from each .pbf; an EMPTY folder is a
+#      world fill (Natural Earth) for its band. Use an explicit <zmin>-<zmax> to
+#      render a narrower range than z0..ceiling.
+#
+#   2. Single file / world — explicit one-offs:
+#
+#          ./tilebake --out ./tiles --pbf berlin.osm.pbf --zoom 10 16 [--bbox W S E N]
+#          ./tilebake --out ./tiles --world --zoom 0 7
+#
+# Either way, tilebake first prints a rough per-map and total disk estimate and
+# asks for confirmation before writing any tiles (skip with --yes).
+#
+# Then copy --out/* onto the SD card so the device sees /sdcard/maps/<z>/<x>/<y>.jpg
+#
+# Options:
+#   --out DIR               output tile tree (REQUIRED; created if absent)
+#   --pbf FILE              single-file mode: this .pbf (needs --zoom)
+#   --world                 single global low-zoom bake (needs --zoom; no pbf)
+#   --pbf-dir DIR           batch mode root             (default ./pbf)
+#   --zoom ZMIN ZMAX        zoom range (single-file / --world mode)
+#   --bbox W S E N          MINLON MINLAT MAXLON MAXLAT (default: read from pbf)
+#   --bin                   raw RGB565 tiles instead of JPEG
+#   --quality N             JPEG quality                (default 80)
+#   --style ID              force a tileserver style id (default: auto)
+#   --java-mem SIZE         planetiler heap, e.g. 6g    (default: auto)
+#   --cache DIR             planetiler source cache     (default ./.tilebake-cache)
+#   --image NAME            image name; a :<inputs-hash> tag is appended so a
+#                           changed Dockerfile/entrypoint/maketiles auto-rebuilds
+#                                                       (default maps-tilebake)
+#   --rebuild               force a rebuild even if the inputs-hash image exists
+#   -y, --yes               skip the size-estimate confirmation prompt
+#   -v, --verbose           stream the docker build + planetiler/maketiles output
+#                           (hidden by default — only ' ERR '/error lines show)
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)   # the maps/tilebake dir
+
+PBF="" PBF_DIR="./pbf" OUT="" ZOOM=() BBOX=() FMT=jpg QUALITY=80
+STYLE="" JAVA_MEM="" CACHE="./.tilebake-cache" IMAGE="maps-tilebake" REBUILD=0
+WORLD_MODE=0 ASSUME_YES=0 VERBOSE=0
+
+# Very rough mean size of one baked 256px tile, used only for the pre-bake
+# estimate. RGB565 .bin is exact (256*256*2). JPEG varies wildly with content
+# (empty ocean ~1KB, dense city tens of KB); ~7.3KB is the blended average a
+# real world + dense-country (Germany) bake came in at — a 1.3GB-at-12KB
+# estimate landed at 789MB actual — so it's calibrated down from the 12KB guess.
+BIN_TILE_BYTES=131072
+JPG_TILE_BYTES=7300
+
+die() { echo "tilebake: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --pbf)      PBF="$2"; shift 2;;
+        --world)    WORLD_MODE=1; shift;;
+        --pbf-dir)  PBF_DIR="$2"; shift 2;;
+        --out)      OUT="$2"; shift 2;;
+        --zoom)     ZOOM=("$2" "$3"); shift 3;;
+        --bbox)     BBOX=("$2" "$3" "$4" "$5"); shift 5;;
+        --bin)      FMT=bin; shift;;
+        --quality)  QUALITY="$2"; shift 2;;
+        --style)    STYLE="$2"; shift 2;;
+        --java-mem) JAVA_MEM="$2"; shift 2;;
+        --cache)    CACHE="$2"; shift 2;;
+        --image)    IMAGE="$2"; shift 2;;
+        --rebuild)  REBUILD=1; shift;;
+        -y|--yes)   ASSUME_YES=1; shift;;
+        -v|--verbose) VERBOSE=1; shift;;
+        -h|--help)  sed -n '2,57p' "$0"; exit 0;;
+        *)          die "unknown arg: $1 (try --help)";;
+    esac
+done
+
+command -v docker >/dev/null || die "docker not found on PATH"
+
+# Output dir is mandatory — no implicit ./out. Create it if needed and fail
+# loudly if it can't be made or resolved, before any expensive work.
+[ -n "$OUT" ] || die "no output dir — pass --out DIR (the <z>/<x>/<y> tree is written there)"
+mkdir -p "$OUT" 2>/dev/null || die "cannot create output dir: $OUT"
+OUT_ABS=$(cd "$OUT" 2>/dev/null && pwd) || die "output dir not found after creating it: $OUT"
+mkdir -p "$CACHE" 2>/dev/null || die "cannot create cache dir: $CACHE"
+CACHE_ABS=$(cd "$CACHE" 2>/dev/null && pwd) || die "cache dir not found: $CACHE"
+
+# Per-map render caches live here (one z0..ceiling tree per map). They're the
+# durable, incremental product: a map is re-rendered only when its source or the
+# pipeline changes. $OUT is then rebuilt from these by the compose step, so OUT
+# is a cheap derived artifact, not something docker has to mount.
+RENDER_ABS="$CACHE_ABS/render"
+mkdir -p "$RENDER_ABS" 2>/dev/null || die "cannot create render cache dir: $RENDER_ABS"
+
+# sha256 of stdin -> bare hex digest. GNU coreutils ships sha256sum; macOS only
+# has `shasum -a 256` out of the box. Pick whichever exists.
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum
+    else shasum -a 256; fi
+}
+
+# Content hash of everything baked into the image: the Dockerfile (its ARG
+# defaults pin the base image + planetiler url, so changing those counts), the
+# in-container entrypoint, and maketiles.py. Concatenated in a fixed order and
+# hashed; 12 hex chars is plenty to never collide in practice.
+#
+# This rides in the image *tag* (maps-tilebake:<hash>), the same trick the
+# spangap build env uses to keep an image from outliving its source — except
+# spangap stamps the hash into a label because its tag is workspace-stable,
+# whereas here the hash IS the tag, so a changed input simply names an image
+# that doesn't exist yet and the build below fires automatically.
+HASH_INPUTS=("$HERE/tilebake-image/Dockerfile" "$HERE/tilebake-image/entrypoint.sh" "$HERE/tilebake-image/pbfbbox.py" "$HERE/tilebake-image/maketiles.py")
+inputs_hash() { cat "${HASH_INPUTS[@]}" | sha256 | awk '{print substr($1,1,12)}'; }
+
+IMAGE_REF="$IMAGE:$(inputs_hash)"
+
+# Build when the exact image for the current inputs is absent (or forced). A
+# changed Dockerfile/entrypoint/maketiles yields a new tag -> guaranteed miss
+# here -> rebuild, with no stale image ever silently reused.
+if [ "$REBUILD" = 1 ] || ! docker image inspect "$IMAGE_REF" >/dev/null 2>&1; then
+    echo "tilebake: building image $IMAGE_REF ..." >&2
+    # The build is noisy; keep it quiet by default (capture to a log, surface it
+    # only on failure) so the next thing the user sees is the size estimate.
+    # -v streams it live instead.
+    if [ "$VERBOSE" = 1 ]; then
+        docker build -f "$HERE/tilebake-image/Dockerfile" -t "$IMAGE_REF" "$HERE"
+    else
+        build_log="$CACHE_ABS/.build.log"
+        if ! docker build -f "$HERE/tilebake-image/Dockerfile" -t "$IMAGE_REF" "$HERE" \
+                >"$build_log" 2>&1; then
+            cat "$build_log" >&2
+            rm -f "$build_log"
+            die "docker build failed (re-run with -v to stream the build)"
+        fi
+        rm -f "$build_log"
+    fi
+    # Superseded builds (older input hashes) only waste disk — drop every tag
+    # of this image except the one we just built.
+    old=$(docker images --format '{{.Repository}}:{{.Tag}}' "$IMAGE" 2>/dev/null \
+            | grep -vx "$IMAGE_REF" || true)
+    [ -n "$old" ] && docker rmi -f $old >/dev/null 2>&1 || true
+fi
+
+# job_sig ZMIN ZMAX PBF -> a signature that changes whenever a re-render is
+# needed: the source's size+mtime (or "world"), the zoom range, format/quality,
+# and the image hash (so an entrypoint/pipeline change invalidates caches too).
+job_sig() {
+    local zmin="$1" zmax="$2" pbf="$3" psig="world"
+    if [ -n "$pbf" ]; then
+        psig=$(stat -c '%s:%Y' "$pbf" 2>/dev/null || stat -f '%z:%m' "$pbf" 2>/dev/null || echo '?')
+    fi
+    printf '%s|z%s-%s|%s|q%s|%s' "$psig" "$zmin" "$zmax" "$FMT" "$QUALITY" "$IMAGE_REF"
+}
+
+# render_job ID ZMIN ZMAX PBF_ABS BBOX
+# Render one map into its own cache tree $RENDER_ABS/<ID> (pbf -> vector ->
+# internal raster server -> device tiles). Skipped when the cache already matches
+# the job signature, so re-runs only render new/changed maps. An empty PBF means
+# "world" (Natural Earth, global bounds). Runs as the invoking uid:gid so the
+# cache stays host-owned; HOME=/tmp because an arbitrary uid has no passwd entry.
+render_job() {
+    local id="$1" zmin="$2" zmax="$3" pbf="$4" bbox="${5:-}"
+    local cdir="$RENDER_ABS/$id" sig; sig=$(job_sig "$zmin" "$zmax" "$pbf")
+    if [ -f "$cdir/.tilebake-sig" ] && [ "$(cat "$cdir/.tilebake-sig")" = "$sig" ] \
+        && ls "$cdir" 2>/dev/null | grep -qE '^[0-9]+$'; then
+        printf '\n\033[1;32m>>> %s  z%s-%s  (cached)\033[0m\n' "$id" "$zmin" "$zmax" >&2
+        return 0
+    fi
+    printf '\n\033[1;32m>>> %s  z%s-%s%s\033[0m\n' \
+        "$id" "$zmin" "$zmax" "${bbox:+  bbox=$bbox}" >&2
+    rm -rf "$cdir"; mkdir -p "$cdir" || die "cannot create cache dir: $cdir"
+    local args=( --rm -i --user "$(id -u):$(id -g)"
+                 -v "$cdir":/out -v "$CACHE_ABS":/cache
+                 -e OUT=/out -e ZMIN="$zmin" -e ZMAX="$zmax"
+                 -e FMT="$FMT" -e QUALITY="$QUALITY" -e VERBOSE="$VERBOSE" )
+    if [ -n "$pbf" ]; then
+        args+=( -v "$pbf":/in/source.osm.pbf:ro -e IN_PBF=/in/source.osm.pbf -e BBOX="$bbox" )
+    else
+        args+=( -e WORLD=1 )
+    fi
+    [ -n "$STYLE" ]    && args+=( -e STYLE="$STYLE" )
+    [ -n "$JAVA_MEM" ] && args+=( -e JAVA_MEM="$JAVA_MEM" )
+    docker run "${args[@]}" "$IMAGE_REF"
+    printf '%s\n' "$sig" > "$cdir/.tilebake-sig"
+}
+
+abspath() { (cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1")"); }
+
+# poly_for PBF -> path of the sibling .poly binding polygon, or "" if none.
+# Geofabrik ships <name>.poly next to <name>.osm.pbf (the exact cut polygon);
+# drop one in the map's folder and compose masks the overlay to it at pixel
+# granularity instead of the rectangular bbox. Strips .osm/.pbf so both
+# foo.osm.pbf and foo.pbf resolve to foo.poly.
+poly_for() {
+    local pbf="$1"
+    [ -n "$pbf" ] || { printf ''; return; }
+    local dir base
+    dir=$(dirname "$pbf"); base=$(basename "$pbf")
+    base=${base%.pbf}; base=${base%.osm}
+    [ -f "$dir/$base.poly" ] && printf '%s' "$dir/$base.poly" || printf ''
+}
+
+# bbox of a pbf as "minlon minlat maxlon maxlat", parsed straight from its header
+# (no osmium, no docker) — the same pbfbbox.py the in-container bake uses, so the
+# estimate and the bake agree. Empty if the file has no usable header bbox (the
+# caller then leaves that job out of the size estimate); the bake still derives
+# it in-container, falling back to osmium's full scan there.
+pbf_bbox() {
+    python3 "$HERE/tilebake-image/pbfbbox.py" "$1" 2>/dev/null || true
+}
+
+# tiles_total MINLON MINLAT MAXLON MAXLAT ZMIN ZMAX -> tile count summed over
+# the range. Mirrors maketiles.py's deg2tile exactly (same web-mercator math,
+# same clamp to [0, 2^z-1], NW=(minlon,maxlat) SE=(maxlon,minlat)) so the
+# estimate counts the tiles the bake will actually write.
+tiles_total() {
+    awk -v minlon="$1" -v minlat="$2" -v maxlon="$3" -v maxlat="$4" -v zmin="$5" -v zmax="$6" 'BEGIN{
+        pi=atan2(0,-1); total=0;
+        for(z=zmin; z<=zmax; z++){
+            n=2^z;
+            x0=dx(minlon,n); x1=dx(maxlon,n);
+            y0=dy(maxlat,n,pi); y1=dy(minlat,n,pi);
+            if(x1<x0){t=x0;x0=x1;x1=t}
+            if(y1<y0){t=y0;y0=y1;y1=t}
+            total += (x1-x0+1)*(y1-y0+1);
+        }
+        printf "%.0f\n", total;
+    }
+    function dx(lon,n,  x){ x=int((lon+180.0)/360.0*n); if(x<0)x=0; if(x>n-1)x=n-1; return x }
+    function dy(lat,n,pi,  r,y){ r=lat*pi/180.0; y=int((1.0-log(sin(r)/cos(r)+1.0/cos(r))/pi)/2.0*n); if(y<0)y=0; if(y>n-1)y=n-1; return y }
+    '
+}
+
+# Job list, built per mode below. Each entry is
+# "id<TAB>zmin<TAB>zmax<TAB>pbf<TAB>bbox": id names the per-map cache dir, the
+# zoom range is what to render, pbf is the source (empty = world), bbox is the
+# map's extent (used to clip overlays at compose). A literal tab separates fields
+# so the space-containing bbox survives as one field.
+TAB=$'\t' NL=$'\n'
+JOBS=()
+add_job() { JOBS+=("$1$TAB$2$TAB$3$TAB$4$TAB$5"); }
+
+# Print a rough per-job + grand-total size estimate and, unless --yes, require a
+# 'y' before any tiles are written. Bounds come from --bbox, the global box for
+# world bakes, or the pbf's own extent; size = tile count x a per-format mean.
+estimate_and_confirm() {
+    local per note
+    if [ "$FMT" = bin ]; then
+        per=$BIN_TILE_BYTES; note="RGB565 .bin, 128 KB/tile (exact)"
+    else
+        per=$JPG_TILE_BYTES
+        note="JPEG q$QUALITY, ~$((JPG_TILE_BYTES/1000)) KB/tile avg — very rough, real size varies a lot"
+    fi
+    printf '%stilebake: estimating output size ...  (%s)%s%s' "$NL" "$note" "$NL" "$NL" >&2
+
+    local rows="" id zmin zmax pbf bbox label tiles
+    for j in "${JOBS[@]}"; do
+        IFS="$TAB" read -r id zmin zmax pbf bbox <<<"$j"
+        if [ -z "$pbf" ]; then
+            label="(world) z$zmin-$zmax"
+            [ -n "$bbox" ] || bbox="-180 -85 180 85"
+        else
+            label="$(basename "$pbf") z$zmin-$zmax"
+            [ -n "$bbox" ] || bbox=$(pbf_bbox "$pbf")
+        fi
+        if [ -z "$bbox" ]; then
+            printf '  %-34s  (bbox unknown — left out of estimate)\n' "$label" >&2
+            continue
+        fi
+        tiles=$(tiles_total $bbox "$zmin" "$zmax")
+        rows="$rows$label$TAB$tiles$NL"
+    done
+
+    printf '%s' "$rows" | awk -F'\t' -v per="$per" '
+        { tiles=$2+0; bytes=tiles*per; gt+=bytes; gc+=tiles;
+          printf "  %-34s %13d tiles  ~%s\n", $1, tiles, hb(bytes); }
+        END { printf "  %-34s %13d tiles  ~%s\n", "GRAND TOTAL", gc, hb(gt); }
+        function hb(b,  u,i){ split("B KB MB GB TB PB",u," "); i=1;
+            while(b>=1024 && i<6){b/=1024;i++}
+            return sprintf((i==1?"%.0f %s":"%.1f %s"), b, u[i]) }
+    ' >&2
+
+    [ "$ASSUME_YES" = 1 ] && return 0
+    printf '%sProceed with baking into %s? [y/N] ' "$NL" "$OUT_ABS" >&2
+    local reply=""
+    if [ -r /dev/tty ]; then read -r reply </dev/tty || reply=""
+    else read -r reply || reply=""; fi
+    case "$reply" in
+        [yY]|[yY][eE][sS]) ;;
+        *) die "aborted — no tiles written";;
+    esac
+}
+
+# --- Assemble the job list per mode -----------------------------------------
+sanitize_id() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+if [ "$WORLD_MODE" = 1 ]; then
+    [ ${#ZOOM[@]} -eq 2 ] || die "--world needs --zoom ZMIN ZMAX"
+    add_job "world" "${ZOOM[0]}" "${ZOOM[1]}" "" ""
+
+elif [ -n "$PBF" ]; then
+    [ -f "$PBF" ] || die "pbf not found: $PBF"
+    [ ${#ZOOM[@]} -eq 2 ] || die "--pbf needs --zoom ZMIN ZMAX"
+    [ ${#BBOX[@]} -eq 0 ] || [ ${#BBOX[@]} -eq 4 ] || \
+        die "--bbox needs 4 numbers: MINLON MINLAT MAXLON MAXLAT"
+    pabs=$(abspath "$PBF")
+    pbbox="${BBOX[*]:-}"; [ -n "$pbbox" ] || pbbox=$(pbf_bbox "$pabs")
+    add_job "$(sanitize_id "$(basename "$PBF")")" "${ZOOM[0]}" "${ZOOM[1]}" "$pabs" "$pbbox"
+
+else
+    # Batch: each ./pbf/<dir>/ folder names a map's zoom CEILING — a bare <zmax>
+    # (e.g. 13) renders from z0, or an explicit <zmin>-<zmax> pins the floor. We
+    # always render each map's full pyramid into its own cache; the compose step
+    # clips overlays to their bbox, so the floor only affects how deep we render,
+    # not edge cleanliness. The folder name is the cache id.
+    [ -d "$PBF_DIR" ] || die "no --pbf/--world given and batch dir not found: $PBF_DIR (see --help)"
+
+    entries=()   # "name<TAB>zmin<TAB>zmax"   (zmin = -1 -> bare, render from z0)
+    for d in "$PBF_DIR"/*/; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        case "$name" in
+            [0-9]*-[0-9]*)
+                zmin=${name%%-*}; zmax=${name##*-}
+                case "$zmin$zmax" in *[!0-9]*) echo "tilebake: skipping '$name' (non-numeric)" >&2; continue;; esac
+                [ "$zmin" -le "$zmax" ] || { t=$zmin; zmin=$zmax; zmax=$t; }
+                entries+=("$name$TAB$zmin$TAB$zmax") ;;
+            [0-9]*)
+                case "$name" in *[!0-9]*) echo "tilebake: skipping non-zoom dir '$name'" >&2; continue;; esac
+                entries+=("$name$TAB-1$TAB$name") ;;   # bare ceiling; render from z0
+            *) echo "tilebake: skipping non-zoom dir '$name'" >&2; continue;;
+        esac
+    done
+    [ ${#entries[@]} -gt 0 ] || die "no zoom folders under $PBF_DIR/ — name each <zmax> (e.g. 7, 13, 16) or <zmin>-<zmax>; an empty folder is a world fill at that band"
+
+    for e in "${entries[@]}"; do
+        IFS="$TAB" read -r name zmin zmax <<<"$e"
+        [ "$zmin" = -1 ] && zmin=0           # bare: render the full pyramid
+        found=0
+        # one glob: *.pbf matches both foo.pbf and foo.osm.pbf, no double-runs.
+        for f in "$PBF_DIR/$name"/*.pbf; do
+            [ -f "$f" ] || continue
+            found=1
+            add_job "$name" "$zmin" "$zmax" "$(abspath "$f")" "$(pbf_bbox "$f")"
+        done
+        # Empty folder -> a world fill for this band.
+        [ "$found" = 0 ] && add_job "$name" "$zmin" "$zmax" "" ""
+    done
+fi
+
+[ ${#JOBS[@]} -gt 0 ] || die "nothing to bake"
+
+# Estimate + confirm before any rendering.
+estimate_and_confirm
+
+# Render order is irrelevant (each map -> its own cache), but compose layers
+# coarsest-first so detail wins; order jobs by ceiling (zmax, field 3).
+IFS=$'\n' ordered=($(printf '%s\n' "${JOBS[@]}" | sort -t"$TAB" -k3,3n)); unset IFS
+
+for j in "${ordered[@]}"; do
+    IFS="$TAB" read -r id zmin zmax pbf bbox <<<"$j"
+    render_job "$id" "$zmin" "$zmax" "$pbf" "$bbox"
+done
+
+# Compose: rebuild OUT from the per-map caches, coarsest first. The base (lowest
+# ceiling) contributes every tile; each overlay is clipped to its region — to a
+# sibling .poly binding polygon at pixel granularity (border tiles composited
+# over the layer beneath), or, lacking one, to its rectangular bbox.
+printf '\n\033[1;36m== composing %s ==\033[0m\n' "$OUT_ABS" >&2
+compose_args=("$OUT_ABS")
+for j in "${ordered[@]}"; do
+    IFS="$TAB" read -r id zmin zmax pbf bbox <<<"$j"
+    compose_args+=( "$RENDER_ABS/$id" "$bbox" "$(poly_for "$pbf")" )
+done
+python3 "$HERE/tilebake-image/compose.py" "${compose_args[@]}" || die "compose failed"
+
+echo "tilebake: done — ${#ordered[@]} map(s) -> $OUT_ABS" >&2

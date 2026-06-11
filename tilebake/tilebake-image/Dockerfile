@@ -9,8 +9,9 @@
 # pbf→vector step, Python/Pillow for the bake step, and an entrypoint that
 # runs the whole chain with the server living entirely inside the container.
 #
-# Build context is the maps/scripts dir (so we can COPY maketiles.py).
-#   docker build -f tilebake/Dockerfile -t maps-tilebake .
+# Build context is the maps/tilebake dir; everything the image needs lives under
+# tilebake-image/ and is COPY'd in below.
+#   docker build -f tilebake-image/Dockerfile -t maps-tilebake .
 
 # Pin to a digest in anger; a moving tag is fine for a workstation tool.
 ARG TSG_TAG=latest
@@ -54,11 +55,12 @@ RUN printf '<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" generator
     && osmium cat /tmp/empty.osm -o /opt/empty.osm.pbf \
     && rm -f /tmp/empty.osm
 
-COPY maketiles.py /opt/maketiles.py
-COPY tilebake/entrypoint.sh /opt/entrypoint.sh
+COPY tilebake-image/maketiles.py /opt/maketiles.py
+COPY tilebake-image/pbfbbox.py /opt/pbfbbox.py
+COPY tilebake-image/entrypoint.sh /opt/entrypoint.sh
 RUN chmod +x /opt/entrypoint.sh /opt/maketiles.py
 
-# Inputs arrive via env (see entrypoint.sh / tilebake.sh):
+# Inputs arrive via env (see entrypoint.sh / tilebake):
 #   IN_PBF, OUT, BBOX, ZMIN, ZMAX, FMT, QUALITY, STYLE, JAVA_MEM
 ENV HOME=/tmp
 WORKDIR /tmp
