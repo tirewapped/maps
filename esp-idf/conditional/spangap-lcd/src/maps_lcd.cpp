@@ -34,6 +34,7 @@
  * launcher, Settings pane) registers via the when:-gated mapsLcdRegister hook.
  */
 #include "maps.h"
+#include "mem.h"
 #include "spangap.h"
 
 #include "lcd.h"          /* pulls in lvgl.h */
@@ -397,7 +398,7 @@ static void rebuild(void) {
     if (recenter)            s_follow = true;
     if ((dx || dy) && s_haveView) s_follow = false;
 
-    Composite* c = (Composite*)malloc(sizeof(Composite));
+    Composite* c = (Composite*)gp_alloc(sizeof(Composite));
     if (!c) return;
     *c = {};
     c->z = base; c->markerX = -1; c->markerY = -1; c->haveFix = fix;
