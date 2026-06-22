@@ -501,6 +501,17 @@ static void mapPressCb(lv_event_t* e) {
     wakeWorker();
 }
 
+/* Edge-pan from the trackball (lcdProgramScrollHandler): the lcd component hands
+ * us the pan delta when the cursor is driven into a screen edge, in the same sign
+ * convention as the finger-drag vector above — so the map canvas, which isn't an
+ * LVGL scroll container, pans on a touchless deck just as it does under a finger. */
+static void mapsScrollCb(int dx, int dy) {
+    portENTER_CRITICAL(&s_ctrlMux);
+    s_panDx += dx; s_panDy += dy;
+    portEXIT_CRITICAL(&s_ctrlMux);
+    wakeWorker();
+}
+
 static void mapCenterCb(lv_event_t* /*e*/) {
     portENTER_CRITICAL(&s_ctrlMux);
     s_recenter = true;
@@ -606,6 +617,7 @@ static void mapsApp(void* arg) {
     lv_obj_center(s_canvas);
     lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);    /* so it gets press/drag */
     lv_obj_add_event_cb(s_canvas, mapPressCb, LV_EVENT_PRESSING, nullptr);
+    lcdProgramScrollHandler(mapsScrollCb);   /* trackball edge-pan -> map pan */
 
     s_label = lv_label_create(layer);
     lv_label_set_text(s_label, "Waiting for GPS...");
