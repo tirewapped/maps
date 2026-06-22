@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
 # tilebake — turn OSM .pbf extracts into the device map-tile tree the 'maps'
-# app reads off SD. The whole chain (planetiler -> tileserver-gl -> maketiles.py)
-# runs inside one container; the tile server lives entirely internal to it.
+# app reads off SD. Each map is rendered to its own vector .mbtiles, then ALL of
+# them are combined in ONE tileserver-gl pass and baked to device tiles. Both
+# steps run inside one container; the tile server lives entirely internal to it.
+#
+# Why combine in the vector domain instead of compositing rasters: a tile shared
+# by two detailed maps (say Netherlands meeting Germany) gets BOTH their data, and
+# a coarser map shows through across a detailed map's border as crisp OVERZOOMED
+# vectors — not the blurry raster upscale a per-tile raster composite was limited
+# to. To stop a coarse map's few-point roads/rivers from drawing *alongside* the
+# detailed ones inside its area, each coarse map is polygon-clipped at render time
+# to exclude the footprint of every strictly-deeper map (its sibling .poly if it
+# ships one, else its bbox) — so stacking the sources is a clean partition.
 #
 # Two ways to run:
 #
 #   1. Batch (zero-config) — the default. Make zoom-named subdirs of ./pbf,
 #      then run with just --out. A folder names the zoom CEILING of the map it
-#      holds (a bare <zmax>); deeper maps overlay shallower ones:
+#      holds (a bare <zmax>); deeper maps win inside their footprint:
 #
 #          pbf/7/                       (empty  -> whole world from Natural Earth)
-#          pbf/13/germany.osm.pbf
-#          pbf/16/berlin.osm.pbf
+#          pbf/13/germany.osm.pbf       (+ germany.poly for an exact clip)
+#          pbf/16/berlin.osm.pbf        (+ berlin.poly)
 #          ./tilebake --out ./tiles
 #
-#      Each map is rendered once into its own cache (.tilebake-cache/render/<dir>,
-#      a full z0..ceiling tree) and re-rendered only when its source or the
-#      pipeline changes — so re-runs skip maps you haven't touched. --out is then
-#      rebuilt from the caches, coarsest ceiling first: the shallowest map fills
-#      everything, and each deeper map overlays only the tiles that fall FULLY
-#      inside its bbox. So detail wins where the extract actually covers (real
-#      OSM roads, not the world fill's Natural-Earth land/water), while bbox-edge
-#      and too-zoomed-out tiles drop and the coarser layer shows through instead
-#      of a half-blank tile. The bbox is read from each .pbf; an EMPTY folder is a
-#      world fill (Natural Earth) for its band. Use an explicit <zmin>-<zmax> to
-#      render a narrower range than z0..ceiling.
+#      Each map renders once to its own vector cache (.tilebake-cache/render/<dir>/
+#      tiles.mbtiles) and re-renders only when its source, its clip (i.e. the set
+#      of deeper maps), or the pipeline changes — so re-runs skip untouched maps.
+#      --out is then baked by combining every cache in one render pass. The bbox is
+#      read from each .pbf; an EMPTY folder is a world fill (Natural Earth) for its
+#      band and is never clipped (it's the universal land/water base). Use an
+#      explicit <zmin>-<zmax> to bake a narrower device-tile band than z0..ceiling
+#      (the vector render is always z0..ceiling, for clean overzoom).
 #
 #   2. Single file / world — explicit one-offs:
 #
@@ -32,7 +39,9 @@
 #          ./tilebake --out ./tiles --world --zoom 0 7
 #
 # Either way, tilebake first prints a rough per-map and total disk estimate and
-# asks for confirmation before writing any tiles (skip with --yes).
+# asks for confirmation before writing any tiles (skip with --yes). --out is
+# written in-container, so it must be a path docker can bind-mount: bake to a
+# normal dir, then copy it onto the SD card.
 #
 # Then copy --out/* onto the SD card so the device sees /sdcard/maps/<z>/<x>/<y>.jpg
 #
@@ -90,7 +99,7 @@ while [ $# -gt 0 ]; do
         --rebuild)  REBUILD=1; shift;;
         -y|--yes)   ASSUME_YES=1; shift;;
         -v|--verbose) VERBOSE=1; shift;;
-        -h|--help)  sed -n '2,57p' "$0"; exit 0;;
+        -h|--help)  sed -n '2,66p' "$0"; exit 0;;
         *)          die "unknown arg: $1 (try --help)";;
     esac
 done
@@ -105,10 +114,10 @@ OUT_ABS=$(cd "$OUT" 2>/dev/null && pwd) || die "output dir not found after creat
 mkdir -p "$CACHE" 2>/dev/null || die "cannot create cache dir: $CACHE"
 CACHE_ABS=$(cd "$CACHE" 2>/dev/null && pwd) || die "cache dir not found: $CACHE"
 
-# Per-map render caches live here (one z0..ceiling tree per map). They're the
-# durable, incremental product: a map is re-rendered only when its source or the
-# pipeline changes. $OUT is then rebuilt from these by the compose step, so OUT
-# is a cheap derived artifact, not something docker has to mount.
+# Per-map vector caches live here (one tiles.mbtiles per map). They're the
+# durable, incremental product: a map is re-rendered only when its source, its
+# clip, or the pipeline changes. $OUT is then baked from these by the combine
+# step, so OUT is a cheap derived artifact.
 RENDER_ABS="$CACHE_ABS/render"
 mkdir -p "$RENDER_ABS" 2>/dev/null || die "cannot create render cache dir: $RENDER_ABS"
 
@@ -129,7 +138,7 @@ sha256() {
 # spangap stamps the hash into a label because its tag is workspace-stable,
 # whereas here the hash IS the tag, so a changed input simply names an image
 # that doesn't exist yet and the build below fires automatically.
-HASH_INPUTS=("$HERE/tilebake-image/Dockerfile" "$HERE/tilebake-image/entrypoint.sh" "$HERE/tilebake-image/pbfbbox.py" "$HERE/tilebake-image/maketiles.py")
+HASH_INPUTS=("$HERE/tilebake-image/Dockerfile" "$HERE/tilebake-image/entrypoint.sh" "$HERE/tilebake-image/pbfbbox.py" "$HERE/tilebake-image/maketiles.py" "$HERE/tilebake-image/style_compose.py")
 inputs_hash() { cat "${HASH_INPUTS[@]}" | sha256 | awk '{print substr($1,1,12)}'; }
 
 IMAGE_REF="$IMAGE:$(inputs_hash)"
@@ -161,47 +170,67 @@ if [ "$REBUILD" = 1 ] || ! docker image inspect "$IMAGE_REF" >/dev/null 2>&1; th
     [ -n "$old" ] && docker rmi -f $old >/dev/null 2>&1 || true
 fi
 
-# job_sig ZMIN ZMAX PBF -> a signature that changes whenever a re-render is
-# needed: the source's size+mtime (or "world"), the zoom range, format/quality,
-# and the image hash (so an entrypoint/pipeline change invalidates caches too).
-job_sig() {
-    local zmin="$1" zmax="$2" pbf="$3" psig="world"
+# vec_sig ZMAX PBF CLIP -> a signature that changes whenever a re-render is
+# needed: the source's size+mtime (or "world"), the vector ceiling, the clip
+# polygon's content (so changing which deeper maps punch holes re-renders), and
+# the image hash (an entrypoint/pipeline change invalidates caches too). Format
+# and quality are NOT here — they're applied later, in the combine bake, not the
+# vector render, so a quality tweak doesn't force every map to re-render.
+vec_sig() {
+    local zmax="$1" pbf="$2" clip="$3" psig="world" csig="noclip"
     if [ -n "$pbf" ]; then
         psig=$(stat -c '%s:%Y' "$pbf" 2>/dev/null || stat -f '%z:%m' "$pbf" 2>/dev/null || echo '?')
     fi
-    printf '%s|z%s-%s|%s|q%s|%s' "$psig" "$zmin" "$zmax" "$FMT" "$QUALITY" "$IMAGE_REF"
+    [ -n "$clip" ] && [ -f "$clip" ] && csig=$(sha256 < "$clip" | awk '{print $1}')
+    printf '%s|z0-%s|clip:%s|%s' "$psig" "$zmax" "$csig" "$IMAGE_REF"
 }
 
-# render_job ID ZMIN ZMAX PBF_ABS BBOX
-# Render one map into its own cache tree $RENDER_ABS/<ID> (pbf -> vector ->
-# internal raster server -> device tiles). Skipped when the cache already matches
-# the job signature, so re-runs only render new/changed maps. An empty PBF means
-# "world" (Natural Earth, global bounds). Runs as the invoking uid:gid so the
-# cache stays host-owned; HOME=/tmp because an arbitrary uid has no passwd entry.
-render_job() {
-    local id="$1" zmin="$2" zmax="$3" pbf="$4" bbox="${5:-}"
-    local cdir="$RENDER_ABS/$id" sig; sig=$(job_sig "$zmin" "$zmax" "$pbf")
+# render_vector_job ID ZMAX PBF_ABS BBOX CLIP_POLY
+# Render one map to its own vector cache $RENDER_ABS/<ID>/tiles.mbtiles: an
+# optional osmium polygon clip (CLIP_POLY's holes are the deeper maps that cover
+# it), then planetiler z0..ZMAX. Skipped when the cache matches the signature, so
+# re-runs only render new/changed maps. An empty PBF means "world" (Natural Earth,
+# global bounds, never clipped). Runs as the invoking uid:gid so the cache stays
+# host-owned; HOME=/tmp because an arbitrary uid has no passwd entry.
+render_vector_job() {
+    local id="$1" zmax="$2" pbf="$3" bbox="${4:-}" clip="${5:-}"
+    local cdir="$RENDER_ABS/$id" sig; sig=$(vec_sig "$zmax" "$pbf" "$clip")
     if [ -f "$cdir/.tilebake-sig" ] && [ "$(cat "$cdir/.tilebake-sig")" = "$sig" ] \
-        && ls "$cdir" 2>/dev/null | grep -qE '^[0-9]+$'; then
-        printf '\n\033[1;32m>>> %s  z%s-%s  (cached)\033[0m\n' "$id" "$zmin" "$zmax" >&2
+        && [ -f "$cdir/tiles.mbtiles" ]; then
+        printf '\n\033[1;32m>>> %s  z0-%s  (cached)\033[0m\n' "$id" "$zmax" >&2
         return 0
     fi
-    printf '\n\033[1;32m>>> %s  z%s-%s%s\033[0m\n' \
-        "$id" "$zmin" "$zmax" "${bbox:+  bbox=$bbox}" >&2
+    printf '\n\033[1;32m>>> %s  z0-%s%s\033[0m\n' "$id" "$zmax" "${clip:+  (clipped)}" >&2
     rm -rf "$cdir"; mkdir -p "$cdir" || die "cannot create cache dir: $cdir"
     local args=( --rm -i --user "$(id -u):$(id -g)"
                  -v "$cdir":/out -v "$CACHE_ABS":/cache
-                 -e OUT=/out -e ZMIN="$zmin" -e ZMAX="$zmax"
-                 -e FMT="$FMT" -e QUALITY="$QUALITY" -e VERBOSE="$VERBOSE" )
+                 -e MODE=render -e OUT=/out -e ZMAX="$zmax" -e VERBOSE="$VERBOSE" )
     if [ -n "$pbf" ]; then
         args+=( -v "$pbf":/in/source.osm.pbf:ro -e IN_PBF=/in/source.osm.pbf -e BBOX="$bbox" )
+        [ -n "$clip" ] && [ -f "$clip" ] && \
+            args+=( -v "$clip":/in/clip.poly:ro -e CLIP_POLY=/in/clip.poly )
     else
         args+=( -e WORLD=1 )
     fi
-    [ -n "$STYLE" ]    && args+=( -e STYLE="$STYLE" )
     [ -n "$JAVA_MEM" ] && args+=( -e JAVA_MEM="$JAVA_MEM" )
     docker run "${args[@]}" "$IMAGE_REF"
     printf '%s\n' "$sig" > "$cdir/.tilebake-sig"
+}
+
+# bbox_comma "MINLON MINLAT MAXLON MAXLAT" -> "MINLON,MINLAT,MAXLON,MAXLAT"
+# (the single-token form mkclip.py accepts for a rectangular outer/hole). Empty in,
+# empty out.
+bbox_comma() {
+    [ -n "${1// }" ] || { printf ''; return; }
+    printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/,/g'
+}
+
+# clip_token PBF BBOX -> how to describe a map's footprint to mkclip: its sibling
+# .poly if it ships one (exact), else its rectangular bbox. Empty if neither.
+clip_token() {
+    local pbf="$1" bbox="$2" p
+    p=$(poly_for "$pbf"); [ -n "$p" ] && { printf '%s' "$p"; return; }
+    bbox_comma "$bbox"
 }
 
 abspath() { (cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1")"); }
@@ -329,10 +358,10 @@ elif [ -n "$PBF" ]; then
 
 else
     # Batch: each ./pbf/<dir>/ folder names a map's zoom CEILING — a bare <zmax>
-    # (e.g. 13) renders from z0, or an explicit <zmin>-<zmax> pins the floor. We
-    # always render each map's full pyramid into its own cache; the compose step
-    # clips overlays to their bbox, so the floor only affects how deep we render,
-    # not edge cleanliness. The folder name is the cache id.
+    # (e.g. 13) bakes device tiles from z0, or an explicit <zmin>-<zmax> pins the
+    # floor. The vector render is always the full z0..ceiling pyramid (for clean
+    # overzoom at combine); the floor only restricts which device-tile band gets
+    # baked. The folder name is the cache id.
     [ -d "$PBF_DIR" ] || die "no --pbf/--world given and batch dir not found: $PBF_DIR (see --help)"
 
     entries=()   # "name<TAB>zmin<TAB>zmax"   (zmin = -1 -> bare, render from z0)
@@ -373,25 +402,71 @@ fi
 # Estimate + confirm before any rendering.
 estimate_and_confirm
 
-# Render order is irrelevant (each map -> its own cache), but compose layers
-# coarsest-first so detail wins; order jobs by ceiling (zmax, field 3).
+# Order jobs coarsest-first by ceiling (zmax, field 3). This drives both the clip
+# hierarchy (a map punches holes for every strictly-deeper map) and the source
+# stacking order in the composite style (deepest drawn last / on top).
 IFS=$'\n' ordered=($(printf '%s\n' "${JOBS[@]}" | sort -t"$TAB" -k3,3n)); unset IFS
 
+# Render every map to its own vector .mbtiles, clipping each coarse map to exclude
+# the footprint of every strictly-deeper map (so its few-point roads/rivers don't
+# survive under the detailed map when the sources are stacked at combine). The
+# holes are the deeper maps' .poly polygons (exact) or their bboxes (fallback);
+# the world fill (empty pbf) is never clipped — it's the universal land/water base.
 for j in "${ordered[@]}"; do
     IFS="$TAB" read -r id zmin zmax pbf bbox <<<"$j"
-    render_job "$id" "$zmin" "$zmax" "$pbf" "$bbox"
+    clip=""
+    if [ -n "$pbf" ]; then
+        holes=()
+        for k in "${ordered[@]}"; do
+            IFS="$TAB" read -r kid kzmin kzmax kpbf kbbox <<<"$k"
+            [ -n "$kpbf" ] || continue           # world is never a hole
+            [ "$kzmax" -gt "$zmax" ] || continue  # only strictly-deeper maps
+            tok=$(clip_token "$kpbf" "$kbbox")
+            [ -n "$tok" ] && holes+=("$tok")
+        done
+        if [ ${#holes[@]} -gt 0 ]; then
+            outer=$(clip_token "$pbf" "$bbox")
+            if [ -n "$outer" ]; then
+                clip="$RENDER_ABS/$id.clip.poly"
+                python3 "$HERE/tilebake-image/mkclip.py" "$clip" "$outer" "${holes[@]}" \
+                    || die "building clip polygon for $id failed"
+            else
+                echo "tilebake: $id has deeper maps but no .poly/bbox to clip against — leaving it unclipped (coarse data may bleed under the detailed maps)" >&2
+            fi
+        fi
+    fi
+    render_vector_job "$id" "$zmax" "$pbf" "$bbox" "$clip"
 done
 
-# Compose: rebuild OUT from the per-map caches, coarsest first. The base (lowest
-# ceiling) contributes every tile; each overlay is clipped to its region — to a
-# sibling .poly binding polygon at pixel granularity (border tiles composited
-# over the layer beneath), or, lacking one, to its rectangular bbox.
-printf '\n\033[1;36m== composing %s ==\033[0m\n' "$OUT_ABS" >&2
-compose_args=("$OUT_ABS")
-for j in "${ordered[@]}"; do
-    IFS="$TAB" read -r id zmin zmax pbf bbox <<<"$j"
-    compose_args+=( "$RENDER_ABS/$id" "$bbox" "$(poly_for "$pbf")" )
-done
-python3 "$HERE/tilebake-image/compose.py" "${compose_args[@]}" || die "compose failed"
+# Manifest: the source list the combine pass reads, coarsest-first. Each source is
+# its vector mbtiles (mounted at /in/<id>/), its ceiling (== maxzoom, for vector
+# overzoom), the zoom band to bake, and its bbox (the area to bake over). The
+# world fill bakes over global bounds.
+manifest="$RENDER_ABS/manifest.json"
+{
+    printf '{\n  "sources": [\n'
+    sep=""
+    for j in "${ordered[@]}"; do
+        IFS="$TAB" read -r id zmin zmax pbf bbox <<<"$j"
+        [ -n "$bbox" ] || bbox="-180 -85 180 85"
+        printf '%s    {"id": "%s", "mbtiles": "/in/%s/tiles.mbtiles", "maxzoom": %s, "zmin": %s, "bbox": "%s"}' \
+            "$sep" "$id" "$id" "$zmax" "$zmin" "$bbox"
+        sep=",$NL"
+    done
+    printf '\n  ]\n}\n'
+} > "$manifest"
+
+# Combine: one tileserver render over ALL maps -> the device tile tree. This is
+# where borders become seamless (a tile shared by two detailed maps gets both;
+# the coarser map shows through across a border as crisp overzoomed vectors) and
+# where FMT/QUALITY apply. OUT is written in-container, so it must be a path
+# docker can bind-mount (bake to a normal dir, then copy onto the SD card).
+printf '\n\033[1;36m== combining %d map(s) -> %s ==\033[0m\n' "${#ordered[@]}" "$OUT_ABS" >&2
+combine_args=( --rm -i --user "$(id -u):$(id -g)"
+               -v "$RENDER_ABS":/in -v "$OUT_ABS":/out
+               -e MODE=combine -e MANIFEST=/in/manifest.json -e OUT=/out
+               -e FMT="$FMT" -e QUALITY="$QUALITY" -e VERBOSE="$VERBOSE" )
+[ -n "$STYLE" ] && combine_args+=( -e STYLE="$STYLE" )
+docker run "${combine_args[@]}" "$IMAGE_REF" || die "combine failed"
 
 echo "tilebake: done — ${#ordered[@]} map(s) -> $OUT_ABS" >&2

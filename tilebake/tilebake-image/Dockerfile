@@ -1,8 +1,15 @@
-# tilebake — one container that turns an .osm.pbf into device map tiles.
+# tilebake — one container that turns .osm.pbf extracts into device map tiles.
 #
-#   pbf ──► planetiler ──► OpenMapTiles-schema vector .mbtiles
-#       ──► tileserver-gl (internal, GL-native raster render of that .mbtiles)
-#       ──► maketiles.py  ──► /<z>/<x>/<y>.{jpg,bin} tree for the 'maps' app
+# Two modes (selected by $MODE, see entrypoint.sh):
+#   render   pbf ──► (osmium polygon clip) ──► planetiler ──► vector .mbtiles
+#   combine  many .mbtiles ──► one multi-source style ──► tileserver-gl (GL-native
+#            raster render of ALL maps at once) ──► maketiles.py ──►
+#            /<z>/<x>/<y>.{jpg,bin} tree for the 'maps' app
+#
+# Combining in the vector domain (one render over all maps) is what makes borders
+# seamless: a tile shared by two detailed maps gets both their data, and a coarser
+# map shows through across a border as crisp overzoomed vectors. Per-map polygon
+# clipping in render mode keeps coarse data out from under the detailed maps.
 #
 # Based on maptiler/tileserver-gl so the GL-native + xvfb rendering stack
 # (the hard part) is already solved. We add a JRE + planetiler for the
@@ -57,11 +64,13 @@ RUN printf '<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" generator
 
 COPY tilebake-image/maketiles.py /opt/maketiles.py
 COPY tilebake-image/pbfbbox.py /opt/pbfbbox.py
+COPY tilebake-image/style_compose.py /opt/style_compose.py
 COPY tilebake-image/entrypoint.sh /opt/entrypoint.sh
 RUN chmod +x /opt/entrypoint.sh /opt/maketiles.py
 
 # Inputs arrive via env (see entrypoint.sh / tilebake):
-#   IN_PBF, OUT, BBOX, ZMIN, ZMAX, FMT, QUALITY, STYLE, JAVA_MEM
+#   render:  IN_PBF, OUT, BBOX, ZMAX, CLIP_POLY, WORLD, JAVA_MEM
+#   combine: MANIFEST, OUT, FMT, QUALITY, STYLE
 ENV HOME=/tmp
 WORKDIR /tmp
 ENTRYPOINT ["/opt/entrypoint.sh"]

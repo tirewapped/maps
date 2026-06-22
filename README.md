@@ -21,10 +21,11 @@ maps/
     ├── tilebake            one-container pbf -> device tiles (wraps the image below)
     └── tilebake-image/     the container build context
         ├── Dockerfile
-        ├── entrypoint.sh   in-container orchestrator (planetiler -> tileserver -> maketiles)
+        ├── entrypoint.sh   in-container orchestrator: render (clip->planetiler) | combine (tileserver->maketiles)
         ├── maketiles.py    the tiler: bake rendered rasters into the device SD tree (also standalone)
         ├── pbfbbox.py      read a pbf's header bounding box (no osmium)
-        └── compose.py      merge per-map render caches into --out (host-side, coarsest-first)
+        ├── style_compose.py  build the multi-source style that stacks all maps in one render
+        └── mkclip.py       build a map's clip polygon (own footprint minus deeper maps; host-side)
 ```
 
 There is no browser half — this is an on-device viewer.
@@ -85,19 +86,22 @@ total disk estimate and waits for a `y`; pass `--yes` to skip.
 **Batch / layered maps:** drop the `--bbox`/`--zoom` and point it at a
 `./pbf/<ceiling>/` tree — one folder per map, named by its top zoom
 (e.g. `7/` empty for a world fill, `13/germany.osm.pbf`,
-`16/berlin.osm.pbf`). Each map is rendered once into its own cache
-(`./.tilebake-cache/render/<dir>`) and only re-rendered when its source
-or the pipeline changes, so re-runs skip untouched maps. `--out` is then
-composed from the caches coarsest-first: the shallowest map fills
-everything and each deeper one overlays only where it actually has data
-— so detail wins where the extract covers (real OSM roads vs the world
-fill's Natural Earth). Drop the map's `.poly` binding polygon next to its
-`.pbf` (Geofabrik ships one per extract) and the overlay is clipped to
-that polygon at **pixel** granularity: tiles the border crosses are
-composited — detailed inside the polygon, the coarser layer showing
-through outside — so the seam follows the real data boundary, not a
-rectangle. With no `.poly`, it falls back to whole-tile clipping at the
-bbox. See the script header.
+`16/berlin.osm.pbf`). Each map renders once to its own vector cache
+(`./.tilebake-cache/render/<dir>/tiles.mbtiles`) and only re-renders when
+its source, the pipeline, or its clip changes, so re-runs skip untouched
+maps. `--out` is then baked by **combining every cache in one
+tileserver-gl render pass**, so the maps merge as *vectors*, not as
+stacked rasters. The win over a raster composite: a tile shared by two
+detailed maps (Netherlands meeting Germany) gets **both** their data, and
+the coarser map shows through across a detailed map's border as **crisp
+overzoomed vectors** instead of a blurry upscale. To stop the coarse
+map's few-point roads/rivers from drawing *alongside* the detailed ones
+inside its area, each coarse map is **polygon-clipped at render time** to
+exclude the footprint of every deeper map — using the map's `.poly`
+binding polygon (Geofabrik ships one per extract; drop it next to the
+`.pbf`) for an exact cut, or its bbox if there's no `.poly`. The world
+fill (an empty folder) is never clipped — it's the universal land/water
+base. See the script header.
 
 Needs Docker. The first run downloads planetiler's global source data
 (water polygons, natural earth — ~1 GB) into `./.tilebake-cache`;
@@ -112,7 +116,7 @@ picks it up.
 
 - [INTERNALS.md](INTERNALS.md) — tile format, worker/lcd split,
   on-device controls + zoom capping, cache policy, and the `tilebake`
-  bake pipeline (planetiler → tileserver-gl → maketiles, per-map render
-  cache, containment compose).
+  bake pipeline (per-map polygon-clipped vector render → one multi-source
+  tileserver-gl pass → maketiles, with the per-map vector cache).
 - The consuming-app doc:
   [docs/maps.md](../hw-tdeck/docs/maps.md).

@@ -13,8 +13,9 @@ the worker tries them in order:
   Bigger on disk but zero-decode; the fallback when no `.jpg` is present.
 
 Slippy coords are **global**: tile `(z, x, y)` is the same geographic square no
-matter which source produced it, so layering different maps is just an
-overwrite by path (see the bake pipeline's compose step).
+matter which source produced it. The device just reads whatever tile is at that
+path; all the work of merging maps into one coherent tree happens at bake time
+(see the bake pipeline's combine step).
 
 **SD cluster-size gotcha:** a tile tree is 10⁵+ tiny files. On a card with large
 FAT clusters (exFAT on big SDXC cards defaults to 64–128 KB) each ~7 KB tile
@@ -78,15 +79,22 @@ like "no tiles here".
 
 Tiles are produced on a workstation, never on the device. `tilebake` runs the
 whole chain in one Docker image (built from `tilebake-image/`, tagged with a
-content hash of its inputs so an edit auto-rebuilds it):
+content hash of its inputs so an edit auto-rebuilds it). It has **two modes** —
+each map is rendered to vectors on its own (`MODE=render`), then all the maps are
+**combined in one render pass** and baked (`MODE=combine`):
 
 ```
-.osm.pbf ─planetiler→ OpenMapTiles vector .mbtiles
-         ─tileserver-gl (GL render, headless via Xvfb)→ raster PNGs
-         ─maketiles.py→ /<z>/<x>/<y>.{jpg,bin} device tree
+per map:   .osm.pbf ─(osmium polygon clip)→ planetiler ─→ OpenMapTiles vector .mbtiles
+combined:  all .mbtiles ─multi-source style→ tileserver-gl (GL render, Xvfb) ─→ raster PNGs
+                                            ─maketiles.py→ /<z>/<x>/<y>.{jpg,bin} device tree
 ```
 
-- **planetiler** turns the pbf into an OMT-schema vector `.mbtiles`. It
+The combine step is the whole point: merging maps as **vectors** (not stacked
+rasters) is what lets a tile straddling two detailed maps carry both their data,
+and lets a coarser map show through across a border as crisp *overzoomed* vectors
+rather than a blurry raster upscale. See [§ Combine](#combine--one-render-over-all-maps).
+
+- **planetiler** turns each pbf into an OMT-schema vector `.mbtiles`. It
   auto-downloads Natural Earth + water polygons once (~1 GB, cached under
   `.tilebake-cache/data`, then offline). `--bounds` = the map's bbox.
   - `--maxzoom` is the requested ceiling, so the whole pipeline renders natively
@@ -100,9 +108,17 @@ content hash of its inputs so an edit auto-rebuilds it):
     level in tileserver-gl/MapLibre (no parent tile to compose it from), which
     would clobber the layer beneath. Rendering from z0 keeps every baked zoom
     above the source floor.
-- **tileserver-gl** GL-renders the vector tiles to raster PNGs on loopback,
-  reusing the image's bundled `basic-preview` style + Noto fonts. Needs an X
-  display, so the entrypoint runs Xvfb.
+- **osmium polygon clip** (render mode, only for a coarse map with deeper maps
+  over it) drops the source's data wherever a deeper map covers, *before*
+  planetiler — so the coarse vector tiles are born without that data and can't
+  draw it under the detailed map. The clip is an osmosis `.poly` whose outer ring
+  is the map's own footprint and whose **holes** are the deeper maps' footprints,
+  built host-side by `mkclip.py`. Each footprint is the map's sibling `.poly`
+  (exact) or its bbox rectangle (fallback). osmium honours the hole rings.
+- **tileserver-gl** GL-renders the vector tiles to raster PNGs on loopback. In
+  combine mode it serves **every** map's `.mbtiles` at once under a generated
+  multi-source style (see below), reusing the image's bundled `basic-preview`
+  layer set + Noto fonts. Needs an X display, so the entrypoint runs Xvfb.
 - **maketiles.py** fetches the raster tiles for the zoom range over the bbox and
   writes the device tree. Also usable standalone against any `{z}/{x}/{y}` URL or
   rendered tree (it refuses `tile.openstreetmap.org` per the tile policy).
@@ -110,45 +126,50 @@ content hash of its inputs so an edit auto-rebuilds it):
   protobuf parse — no osmium, instant on multi-GB files). osmium's full scan is
   only an in-container fallback for extracts lacking a header bbox.
 
-### Per-map render cache + incremental
+### Per-map vector cache + incremental
 
-Each map renders once into its own tree under `.tilebake-cache/render/<dir>/`,
-stamped with a signature (`source size+mtime | zoom range | format | quality |
+Each map renders once to its own `.tilebake-cache/render/<dir>/tiles.mbtiles`,
+stamped with a signature (`source size+mtime | vector ceiling | clip-poly hash |
 image hash`). A re-run skips a map whose signature still matches, so changing one
-extract re-renders only that one; the image-hash term means a pipeline change
-invalidates every cache.
+extract re-renders only that one; changing the set of *deeper* maps changes a
+coarse map's clip-poly hash and re-renders just it; the image-hash term means a
+pipeline change invalidates every cache. Format/quality are **not** in the
+signature — they apply later, at combine, so a quality tweak re-bakes without
+re-rendering any vectors.
 
-### Compose — layering by containment
+### Combine — one render over all maps
 
-`compose.py` (host-side, so `--out` can be a card Docker can't mount) rebuilds
-`--out` from the caches, **coarsest ceiling first**:
+The combine pass (`MODE=combine`) is where the maps actually merge. `tilebake`
+writes a manifest of the caches, coarsest-ceiling first, and the container:
 
-- the shallowest map is the **base** — every tile copied (nothing lies beneath);
-- each deeper map is an **overlay**, clipped to its region.
+1. **Builds a multi-source style** (`style_compose.py`) — it takes the bundled
+   single-source OMT style and clones its data-layer stack **once per source**,
+   coarsest→deepest, each clone bound to that source. So a z13 tile renders the
+   world fill (overzoomed from z7), then Europe (overzoomed from z9), then Germany
+   (native z13), then Berlin… each drawing on top of the last.
+2. **Serves all the `.mbtiles` together** in one tileserver-gl, then **bakes** the
+   composite with `maketiles.py` over each map's bbox and zoom band.
 
-Because tile names are global, a later map cleanly overwrites (or composites
-onto) an earlier one, so the most-detailed map wins wherever it covers. The clip
-takes one of two forms:
+Two properties fall out of merging as vectors rather than rasters:
 
-- **`.poly` polygon (pixel-accurate).** Drop the extract's binding polygon —
-  Geofabrik ships `<name>.poly` next to `<name>.osm.pbf`, the exact cut shape —
-  into the map's folder. compose rasterises it into a 256×256 mask per tile:
-  tiles wholly inside are hard-linked as-is, wholly-outside dropped, and the ones
-  the border crosses are **composited** — detailed pixels inside the polygon, the
-  layer already in `--out` showing through outside it (the nearest lower-zoom
-  ancestor upscaled when no same-zoom tile exists, the same overzoom the device
-  does). This kills the regional extract's "roads fade to plain land" edge: the
-  seam now follows the real data boundary at the pixel.
-- **bbox (whole-tile).** With no `.poly`, a tile is kept only if it lies fully
-  inside the map's bbox — dropping the rectangle edge and too-zoomed-out tiles.
-  Exact for a bbox-cut extract (its true boundary *is* the rectangle).
+- **Detail wins by data presence, not by overwrite.** Because every coarse map was
+  polygon-clipped to exclude deeper footprints, there's no coarse data inside a
+  detailed map to draw — the stack is a clean partition. A tile shared by two
+  detailed maps (Netherlands ∪ Germany) gets *both* their data in the one render.
+- **The background across a border is crisp.** Outside a detailed map the next
+  coarser source shows through, and being a vector source MapLibre **overzooms** it
+  (renders its z9 geometry at z13) — sharp lines, not the blurry, re-compressed
+  raster upscale a per-tile raster composite was stuck with.
 
-Unmodified tiles are hard-linked from the cache when `--out` is on the same
-filesystem (instant, no extra space) or copied to a card; composited border tiles
-are decoded, blended and re-encoded (needs Pillow; `--bin` also needs numpy).
+The world fill (empty folder) is never clipped: it's the universal land/water base
+that every deeper map draws on top of. Each source bakes over `[zmin..ceiling]` of
+its own bbox; low zooms are re-fetched by several sources (identical bytes, cheap),
+deep zooms only by the maps that reach them, so there's no giant-union blow-up.
 
-Before any of this, `tilebake` prints a rough per-map + total size estimate
-(tile count × a calibrated per-tile mean) and waits for confirmation.
+`--out` is written in-container (the raster render must run where tileserver-gl
+is), so it must be a path Docker can bind-mount — bake to a normal dir, then copy
+onto the SD card. Before any of this, `tilebake` prints a rough per-map + total
+size estimate (tile count × a calibrated per-tile mean) and waits for confirmation.
 
 ## Why this straddle isn't in the RNS family
 
