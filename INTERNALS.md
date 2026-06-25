@@ -133,7 +133,10 @@ stamped with a signature (`source size+mtime | vector ceiling | clip-poly hash |
 image hash`). A re-run skips a map whose signature still matches, so changing one
 extract re-renders only that one; changing the set of *deeper* maps changes a
 coarse map's clip-poly hash and re-renders just it; the image-hash term means a
-pipeline change invalidates every cache. Format/quality are **not** in the
+pipeline change invalidates every cache — pass `--keep-renders` to override that
+when you know an `entrypoint.sh`/image edit can't change render output (it ignores
+the image-hash term and also adopts a completed-but-unstamped render a crash left
+behind, so only genuinely changed maps re-render). Format/quality are **not** in the
 signature — they apply later, at combine, so a quality tweak re-bakes without
 re-rendering any vectors.
 

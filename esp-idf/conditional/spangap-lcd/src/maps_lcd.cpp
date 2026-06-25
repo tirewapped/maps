@@ -99,7 +99,7 @@ static lv_timer_t* s_zoomHideTimer = nullptr;
 /* ─────────────── tile cache (shared, guarded by s_mux) ─────────────── */
 
 struct TileBuf { int z, x, y; bool valid; uint16_t* px; uint32_t lru; };
-static TileBuf          s_cache[MAPS_CACHE] = {};
+PSRAM_BSS static TileBuf          s_cache[MAPS_CACHE] = {};
 static SemaphoreHandle_t s_mux = nullptr;
 static uint32_t          s_lruClock = 0;
 

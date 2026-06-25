@@ -61,6 +61,10 @@
 #                           changed Dockerfile/entrypoint/maketiles auto-rebuilds
 #                                                       (default maps-tilebake)
 #   --rebuild               force a rebuild even if the inputs-hash image exists
+#   --keep-renders          reuse per-map vector caches even when the pipeline
+#                           image hash changed (and adopt a completed-but-unstamped
+#                           render left by a crash) — for entrypoint edits you KNOW
+#                           don't alter render output; skips re-rendering every map
 #   -y, --yes               skip the size-estimate confirmation prompt
 #   -v, --verbose           stream the docker build + planetiler/maketiles output
 #                           (hidden by default — only ' ERR '/error lines show)
@@ -70,7 +74,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)   # the maps/tilebake dir
 
 PBF="" PBF_DIR="./pbf" OUT="" ZOOM=() BBOX=() FMT=jpg QUALITY=80
 STYLE="" JAVA_MEM="" CACHE="./.tilebake-cache" IMAGE="maps-tilebake" REBUILD=0
-WORLD_MODE=0 ASSUME_YES=0 VERBOSE=0
+WORLD_MODE=0 ASSUME_YES=0 VERBOSE=0 KEEP_RENDERS=0
 
 # Very rough mean size of one baked 256px tile, used only for the pre-bake
 # estimate. RGB565 .bin is exact (256*256*2). JPEG varies wildly with content
@@ -97,9 +101,10 @@ while [ $# -gt 0 ]; do
         --cache)    CACHE="$2"; shift 2;;
         --image)    IMAGE="$2"; shift 2;;
         --rebuild)  REBUILD=1; shift;;
+        --keep-renders) KEEP_RENDERS=1; shift;;
         -y|--yes)   ASSUME_YES=1; shift;;
         -v|--verbose) VERBOSE=1; shift;;
-        -h|--help)  sed -n '2,66p' "$0"; exit 0;;
+        -h|--help)  sed -n '2,70p' "$0"; exit 0;;
         *)          die "unknown arg: $1 (try --help)";;
     esac
 done
@@ -195,10 +200,23 @@ vec_sig() {
 render_vector_job() {
     local id="$1" zmax="$2" pbf="$3" bbox="${4:-}" clip="${5:-}"
     local cdir="$RENDER_ABS/$id" sig; sig=$(vec_sig "$zmax" "$pbf" "$clip")
-    if [ -f "$cdir/.tilebake-sig" ] && [ "$(cat "$cdir/.tilebake-sig")" = "$sig" ] \
-        && [ -f "$cdir/tiles.mbtiles" ]; then
-        printf '\n\033[1;32m>>> %s  z0-%s  (cached)\033[0m\n' "$id" "$zmax" >&2
-        return 0
+    # Cache hit if a real tiles.mbtiles is present and its stamp matches. Normally
+    # that's an exact match. With --keep-renders the trailing image-hash field is
+    # ignored (so a pipeline edit that can't change output doesn't re-render), and
+    # a present-but-unstamped render is adopted (a crash after the render but before
+    # the stamp, e.g. the cleanup-trap bug). On any keep-renders hit we (re)write
+    # the current stamp so a later run WITHOUT the flag also sees it as cached.
+    if [ -f "$cdir/tiles.mbtiles" ]; then
+        local stamp=""; [ -f "$cdir/.tilebake-sig" ] && stamp=$(cat "$cdir/.tilebake-sig")
+        if [ "$stamp" = "$sig" ]; then
+            printf '\n\033[1;32m>>> %s  z0-%s  (cached)\033[0m\n' "$id" "$zmax" >&2
+            return 0
+        fi
+        if [ "$KEEP_RENDERS" = 1 ] && { [ -z "$stamp" ] || [ "${stamp%|*}" = "${sig%|*}" ]; }; then
+            printf '\n\033[1;32m>>> %s  z0-%s  (kept: render reused)\033[0m\n' "$id" "$zmax" >&2
+            printf '%s\n' "$sig" > "$cdir/.tilebake-sig"
+            return 0
+        fi
     fi
     printf '\n\033[1;32m>>> %s  z0-%s%s\033[0m\n' "$id" "$zmax" "${clip:+  (clipped)}" >&2
     rm -rf "$cdir"; mkdir -p "$cdir" || die "cannot create cache dir: $cdir"

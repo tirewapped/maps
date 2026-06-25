@@ -57,6 +57,16 @@ do_render() {
     : "${OUT:?set OUT}"; : "${ZMAX:?set ZMAX}"
     mkdir -p "$CACHE" "$OUT"
     local src
+    # planetiler's pass-1 node map and the clipped-pbf copy can run to tens of GB
+    # for a country extract. They MUST land on the bind-mounted host cache, not the
+    # container's /tmp — on Docker Desktop /tmp is the VM's small disk image and
+    # fills mid-render ("No space left on device"). A per-run subdir under /cache
+    # keeps concurrent renders from colliding; trap-cleaned on exit.
+    # NB: WORK is intentionally NOT 'local' — the EXIT trap runs after this
+    # function returns, in global scope, so a local would be out of scope there
+    # (and unbound under set -u, aborting the run).
+    WORK=$(mktemp -d "$CACHE/.work.XXXXXX")
+    trap 'rm -rf "${WORK:-}"' EXIT
 
     if [ "${WORLD:-0}" = 1 ]; then
         # World fill: no source pbf — render the globe from the cached Natural
@@ -89,9 +99,9 @@ do_render() {
             # --no-progress. Default to the quiet path (suppress the meter), only
             # going verbose when asked.
             osmium extract --overwrite --strategy complete_ways \
-                -p "$CLIP_POLY" "$IN_PBF" -o /tmp/clipped.osm.pbf \
+                -p "$CLIP_POLY" "$IN_PBF" -o "$WORK/clipped.osm.pbf" \
                 $([ "$VERBOSE" = 1 ] && echo --verbose || echo --no-progress)
-            src=/tmp/clipped.osm.pbf
+            src="$WORK/clipped.osm.pbf"
         fi
     fi
 
@@ -107,13 +117,24 @@ do_render() {
     # the source floor. planetiler/OMT cap vector zoom (~z15) and OSM carries no
     # real detail above ~z14, so a higher ceiling may error or only yield larger
     # tiles, not more detail.
-    log "building vector tiles  z0-$ZMAX  ->  $OUT/tiles.mbtiles"
+    #
+    # planetiler HARD-caps the stored maxzoom at 16 (it errors above that). A
+    # higher folder ceiling is still honoured for the DEVICE tiles: clamp only what
+    # planetiler stores, then let the combine bake overzoom those z16 vectors up to
+    # $ZMAX (tileserver-gl serves above a vector source's maxzoom natively), same as
+    # the cross-border overzoom. So the device tree still reaches $ZMAX.
+    local PZMAX="$ZMAX"
+    if [ "$PZMAX" -gt 16 ]; then
+        PZMAX=16
+        vlog "planetiler maxzoom clamped $ZMAX -> 16 (tool hard cap); device tiles still bake to z$ZMAX via overzoom"
+    fi
+    log "building vector tiles  z0-$PZMAX  ->  $OUT/tiles.mbtiles"
     vlog "planetiler: $src -> $OUT/tiles.mbtiles  bounds $MINLON,$MINLAT,$MAXLON,$MAXLAT"
     cd "$CACHE"   # planetiler caches downloaded sources under ./data here
     local pt=( java ${JAVA_MEM:+-Xmx"$JAVA_MEM"} -jar /opt/planetiler.jar
                --osm-path="$src" --output="$OUT/tiles.mbtiles"
                --bounds="$MINLON,$MINLAT,$MAXLON,$MAXLAT"
-               --maxzoom="$ZMAX" --tmpdir=/tmp/planetiler-tmp --download --force )
+               --maxzoom="$PZMAX" --tmpdir="$WORK/planetiler-tmp" --download --force )
     if [ "$VERBOSE" = 1 ]; then
         "${pt[@]}"
     else
@@ -122,7 +143,6 @@ do_render() {
         local rc=${PIPESTATUS[0]}; set -e
         [ "$rc" -eq 0 ] || { echo "planetiler failed — re-run tilebake with -v for the full log" >&2; exit 1; }
     fi
-    rm -rf /tmp/planetiler-tmp /tmp/clipped.osm.pbf
     log "done -> $OUT/tiles.mbtiles"
 }
 
