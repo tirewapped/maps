@@ -38,6 +38,7 @@
 #include "spangap.h"
 
 #include "lcd.h"          /* pulls in lvgl.h */
+#include "lcd_app.h"      /* LcdApp + lcdInstall */
 #include "fs.h"
 #include "storage.h"
 
@@ -593,14 +594,7 @@ static lv_obj_t* makeGreyBtn(lv_obj_t* parent, const char* label, int yoff, lv_e
     return b;
 }
 
-static void mapsApp(void* arg) {
-    lv_obj_t* layer = (lv_obj_t*)arg;
-    storageSet("tdeck.multi_touch", 1);   /* we want pinch gestures while open */
-    if (s_canvas) {                 /* re-open: layer was kept, just refresh */
-        s_open = true; wakeWorker();
-        return;
-    }
-
+static void mapsBuild(lv_obj_t* layer) {
     int W = lv_obj_get_content_width(layer);
     int H = lv_obj_get_content_height(layer);
     if (W <= 0) W = 320;
@@ -657,10 +651,33 @@ static void mapsApp(void* arg) {
     lv_obj_center(s_zoomLabel);
     lv_obj_add_flag(s_zoomWidget, LV_OBJ_FLAG_HIDDEN);
 
-    lcdTouchAddGestureHandler(mapsGesture);   /* pinch-to-zoom */
-
-    s_open = true; wakeWorker();
+    static bool s_gestureHooked = false;   /* fixed handler set: register once */
+    if (!s_gestureHooked) { lcdTouchAddGestureHandler(mapsGesture); s_gestureHooked = true; }
 }
+
+/* MapsApp — the launcher program as an LcdApp. onCreate builds the canvas once;
+ * onShow (re)arms multi-touch + the render worker on every open; onClose tears
+ * the canvas down so a later reopen rebuilds (the old static-pointer reopen
+ * shortcut dangled after the layer was deleted, hanging the render worker). */
+namespace {
+class MapsApp : public LcdApp {
+public:
+    MapsApp() : LcdApp({ .name = "Maps", .iconBasename = "maps" }) {}
+    void onCreate(lv_obj_t* root) override { mapsBuild(root); }
+    void onShow() override {
+        storageSet("tdeck.multi_touch", 1);   /* pinch gestures while open */
+        s_open = true; wakeWorker();
+    }
+    void onClose() override {
+        s_open = false;
+        storageSet("tdeck.multi_touch", 0);
+        if (s_zoomHideTimer) { lv_timer_delete(s_zoomHideTimer); s_zoomHideTimer = nullptr; }
+        s_canvas = nullptr; s_label = nullptr;
+        s_zoomWidget = nullptr; s_zoomLabel = nullptr;
+        if (s_canvasBuf) { free(s_canvasBuf); s_canvasBuf = nullptr; }
+    }
+};
+}  // namespace
 
 /* ─────────────── CLI + settings ─────────────── */
 
@@ -720,6 +737,6 @@ void mapsLcdRegister(void) {
      * safe from any init task; the launcher entry is read when the grid is
      * built, on the lcd task after lcdInit), so registering here — from
      * spangapInitStraddles(), before lcdInit — is fine. */
-    lcdRegister("Maps", "maps", mapsApp);
+    lcdRun([](void*) { lcdInstall(new MapsApp()); });   /* tile build is LVGL: on the lcd task */
     lcdRegisterSettings("Maps", "Maps", mapsSettingsPane);
 }
