@@ -1,11 +1,11 @@
 /**
  * maps — on-device offline map viewer (T-Deck Plus LCD).
  *
- * A launcher program that draws pre-baked RGB565 slippy-map tiles read from the
- * SD card (default /sdcard/maps/<z>/<x>/<y>.bin), centred on the live GPS fix
- * (gps.* ephemeral vars) with a position marker. Tiles are generated on a
- * computer with scripts/maketiles.py — nothing is rendered or fetched on the
- * device. The viewer lives in the LCD slice (conditional/spangap-lcd/) and
+ * A launcher program that draws pre-baked slippy-map tiles read from the SD
+ * card (default /sdcard/maps/<z>/<x>/<y>.jpg, raw .bin fallback), centred on
+ * the live GPS fix (gps.* ephemeral vars) with a position marker. Tiles are
+ * baked on a computer with the tilebake toolchain — nothing is rendered or
+ * fetched on the device. The viewer lives in the LCD slice (conditional/spangap-lcd/) and
  * registers via the when:-gated mapsLcdRegister hook; mapsInit() is a no-op.
  *
  * Config:    s.maps.zoom (slippy zoom), s.maps.tiledir (SD path)

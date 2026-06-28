@@ -1,9 +1,9 @@
 /**
  * maps_lcd — on-device offline map viewer (the maps program's LCD slice).
  *
- * Draws pre-baked RGB565 slippy-map tiles read off the SD card, with a GPS
- * position marker. Nothing is rendered or fetched on the device: tiles are
- * produced on a computer (scripts/maketiles.py) and copied to the SD card as
+ * Draws pre-baked slippy-map tiles read off the SD card, with a GPS position
+ * marker. Nothing is rendered or fetched on the device: tiles are baked on a
+ * computer (the tilebake toolchain) and copied to the SD card as
  * /sdcard/maps/<z>/<x>/<y>.jpg (decoded on the worker via esp_jpeg) or .bin
  * (raw 256x256 little-endian RGB565 — LVGL's native canvas order, byte-swapped
  * for the ST7789 on flush). .jpg is tried first, .bin is the fallback.
@@ -58,7 +58,6 @@
 
 static const char* TAG = "maps";
 
-#define MAPS_VERSION 1
 #define TILE         256
 #define TILE_BYTES   (TILE * TILE * 2)
 #define MAPS_CACHE   16         /* display tiles + overzoom ancestors + pan margin */
@@ -700,14 +699,6 @@ static void cliMaps(const char* args) {
     if (s_haveView)   cliPrintf("view:    %.6f, %.6f\n", s_viewLat, s_viewLon);
 }
 
-static void mapsSettingsPane(void* arg) {
-    lv_obj_t* p = (lv_obj_t*)arg;
-    lcdSettingSection(p, "Map");
-    lcdSettingSlider (p, "Zoom",     "s.maps.zoom", ZOOM_MIN, ZOOM_MAX);
-    lcdSettingValue  (p, "Status",   "maps.state");
-    lcdSettingText   (p, "Tile dir", "s.maps.tiledir");
-}
-
 /* ─────────────── init ─────────────── */
 
 /* Register the maps program — a when:-gated init: hook (spangap/spangap-lcd).
@@ -716,15 +707,11 @@ static void mapsSettingsPane(void* arg) {
  * generated dispatcher's forward decl.
  *
  * Everything maps does is the LCD viewer — the render worker exists only to feed
- * the canvas, the CLI verb reports map state, the storage defaults configure the
- * map — so all of it is gated behind this hook. Without lcd staged the hook is
- * simply never called (matching the old no-op mapsInit in non-LCD builds). */
+ * the canvas, the CLI verb reports map state — so all of it is gated behind this
+ * hook. Without lcd staged the hook is simply never called (matching the old
+ * no-op mapsInit in non-LCD builds). Storage defaults and the Settings pane are
+ * generated from the settings: block in straddle.yaml, not registered here. */
 void mapsLcdRegister(void) {
-    if (storageGetInt("s.maps.version", 0) < MAPS_VERSION) {
-        storageDefault("s.maps.zoom", 15);
-        storageDefault("s.maps.tiledir", "/sdcard/maps");
-        storageSet("s.maps.version", MAPS_VERSION);
-    }
     /* GPS is the board's call, not ours: hw-tdeck defaults s.gps.enable on (it
      * has the hardware), and the user owns it thereafter. Forcing it on at every
      * maps init clobbered that choice on every boot. */
@@ -732,11 +719,8 @@ void mapsLcdRegister(void) {
     cliRegisterCmd("maps", cliMaps);
     s_worker = spawnTask(mapsWorker, TAG, 8192, nullptr, 1, 1, STACK_PSRAM);
 
-    /* Self-register the launcher program + Settings pane. Both push into
-     * registries the lcd task reads lazily (lcdRegisterSettings is documented
-     * safe from any init task; the launcher entry is read when the grid is
-     * built, on the lcd task after lcdInit), so registering here — from
+    /* Self-register the launcher program. The launcher entry is read when the
+     * grid is built, on the lcd task after lcdInit, so registering here — from
      * spangapInitStraddles(), before lcdInit — is fine. */
     lcdRun([](void*) { lcdInstall(new MapsApp()); });   /* tile build is LVGL: on the lcd task */
-    lcdRegisterSettings("Maps", "Maps", mapsSettingsPane);
 }

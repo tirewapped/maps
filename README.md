@@ -2,59 +2,113 @@
 
 ## What is this?
 
-**maps** is an offline slippy-map viewer for spangap LCD devices: an LCD
-launcher program that blits pre-baked map tiles (JPEG or raw RGB565) read
-from SD, centred on the live GPS fix, with drag-to-pan and pinch/button
-zoom. Independent of the RNS family — published under `reticulous/` for
-discoverability, but any LCD buildable straddle can consume it. Doubles as
-the docs' "first non-RNS feature straddle" walkthrough.
+**maps** is an offline slippy-map viewer for spangap LCD devices: an LVGL
+launcher app that blits pre-baked map tiles (JPEG, with a raw RGB565 fallback)
+read from SD, centred on the live GPS fix, with drag-to-pan and pinch/button
+zoom. Nothing is rendered or fetched on the device — tiles are baked on a
+workstation (see [Tile baking](#tile-baking)) and copied to the SD card.
+Independent of the RNS family — published under `reticulous/` for
+discoverability, but any LCD buildable straddle can consume it. Doubles as the
+docs' "first non-RNS feature straddle" walkthrough.
+
+## Origins
+
+The desktop-renders / device-only-blits split follows
+[`esp32_offline_osm`](https://github.com/mryndzionek/esp32_offline_osm): the
+heavy vector→raster rendering and the OSM dataset stay on a computer; the MCU
+only does file-read, JPEG-decode, and blit. The on-SD raw format differs (this
+viewer stores tiles in LVGL's native little-endian RGB565, not that project's
+direct-to-panel byte order) — see [INTERNALS.md](INTERNALS.md).
 
 ## What this straddle owns
 
 ```
 maps/
 ├── esp-idf/
-│   ├── include/maps.h
-│   ├── src/maps.cpp        worker task + lcd-side compositor
-│   └── lcd/src/maps_lcd.cpp  the LCD launcher program (slice)
+│   ├── include/maps.h                public API: mapsInit (a no-op)
+│   ├── src/maps.cpp                  the straddle init hook — mapsInit() does nothing
+│   └── conditional/spangap-lcd/
+│       └── src/maps_lcd.cpp          the entire viewer: render worker task, LVGL
+│                                     compositor, CLI verb, and the LcdApp launcher.
+│                                     Compiled only when the lcd straddle is staged.
 └── tilebake/
-    ├── tilebake            one-container pbf -> device tiles (wraps the image below)
-    └── tilebake-image/     the container build context
+    ├── tilebake                      one-container pbf -> device tiles (wraps the image below)
+    └── tilebake-image/               the container build context
         ├── Dockerfile
-        ├── entrypoint.sh   in-container orchestrator: render (clip->planetiler) | combine (tileserver->maketiles)
-        ├── maketiles.py    the tiler: bake rendered rasters into the device SD tree (also standalone)
-        ├── pbfbbox.py      read a pbf's header bounding box (no osmium)
-        ├── style_compose.py  build the multi-source style that stacks all maps in one render
-        └── mkclip.py       build a map's clip polygon (own footprint minus deeper maps; host-side)
+        ├── entrypoint.sh             in-container orchestrator: render (clip->planetiler) | combine (tileserver->maketiles)
+        ├── maketiles.py              the tiler: bake rendered rasters into the device SD tree (also standalone)
+        ├── pbfbbox.py                read a pbf's header bounding box (no osmium)
+        ├── style_compose.py          build the multi-source style that stacks all maps in one render
+        └── mkclip.py                 build a map's clip polygon (own footprint minus deeper maps; host-side)
 ```
 
-There is no browser half — this is an on-device viewer.
+This is an on-device viewer only — there is no browser UI.
 
 ## How others use it
 
-The straddle uses `spangap-lcd`'s activator pattern. Add `reticulous/maps`
-to your app's `straddle.yaml` `requires:` list, and a "Maps" tile
-appears in the LCD launcher.
+Include `reticulous/maps` in an LCD build and a **Maps** tile appears in the
+launcher. There is nothing to call: `mapsInit()` is a no-op, and the viewer
+(render worker, CLI verb, Settings pane, launcher app) is brought up
+automatically by the build's generated init through `mapsLcdRegister` — a hook
+compiled in and run only when the `spangap-lcd` straddle is staged. In a
+non-LCD build there is no map.
 
 The map reads its tiles from SD at the default path
-`/sdcard/maps/<z>/<x>/<y>.jpg` (or `.bin`), 256×256. Tiles are read on
-demand and cached in PSRAM by the maps worker task.
-
-GPS fix is read via **ephemeral `gps.*` storage keys** — there is no
-compile-time GPS dependency. The GNSS chip can live in the consuming
-buildable straddle (today: in hw-tdeck's `gps.cpp`) until a GPS
+`/sdcard/maps/<z>/<x>/<y>.jpg` (or `.bin`), 256×256, read on demand and cached
+in PSRAM by the render worker. The GPS fix arrives through ephemeral `gps.*`
+storage keys, so there is no compile-time GPS dependency — the GNSS chip lives
+in the consuming buildable straddle (today hw-tdeck's `gps.cpp`) until a GPS
 service abstraction earns its own straddle.
 
-**Controls:** follows the GPS fix; drag to free-pan, the bottom-right
-button re-centres. Zoom with pinch or the bottom-left `+`/`−` buttons —
-zoom is capped to where the SD actually has tiles (it won't zoom into
-blur, and auto-zooms-out if you leave a detailed area's coverage), and a
-`z<NN>` pill flashes for 2 s on each change. See [INTERNALS.md](INTERNALS.md).
+**Controls:** follows the GPS fix; drag (touch or trackball) to free-pan, the
+bottom-right button re-centres. Zoom with pinch or the bottom-left `+`/`−`
+buttons — zoom is capped to where the SD actually has tiles (it won't zoom into
+blur, and auto-zooms-out if you leave a detailed area's coverage), and a `z<NN>`
+pill flashes for 2 s on each change. See [INTERNALS.md](INTERNALS.md).
+
+## Storage variables
+
+Settings live under `s.maps.*` and are owned by the straddle.yaml `settings:`
+block, which generates both the Maps Settings pane (LCD + web) and the storage
+defaults. Runtime state is published under `maps.*`; the GPS fix is read from
+ephemeral `gps.*`.
+
+### Settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `s.maps.zoom` | `15` | Slippy zoom level, clamped 1–19. Written back when the effective zoom is capped down to the tiles actually present. |
+| `s.maps.tiledir` | `/sdcard/maps` | SD path holding the `<z>/<x>/<y>.{jpg,bin}` tile tree. |
+
+### Runtime state (written)
+
+| Key | Values |
+|---|---|
+| `maps.state` | `ready` / `no tiles` / `no fix` / `no sd` — ephemeral, shown read-only in the Settings pane. |
+
+### GPS fix (read, ephemeral)
+
+| Key | Meaning |
+|---|---|
+| `gps.lat` / `gps.lon` | WGS84 degrees — the fix the map centres on. |
+| `gps.sats_view` / `gps.snr` | Satellites in view / best signal, shown on the acquisition screen before a fix. |
+
+While the app is open it sets ephemeral `tdeck.multi_touch` to `1` (and back to
+`0` on close) so the board reports both fingers for pinch.
+
+## CLI
+
+```
+maps           map status — state, sd, zoom, follow/pan, tiledir, GPS & view centres
+maps center    recentre on the GPS fix
+```
+
+Run on-device through `spangap cli "<command>"`.
 
 ## Dependencies
 
-- [spangap-core](../../s/spangap-core) — fs (SD), storage (gps.*).
-- [spangap-lcd](../../s/spangap-lcd) — the LVGL launcher this hooks into.
+- [spangap-core](../spangap-core) — fs (SD reads), storage (`s.maps.*`, `gps.*`).
+- [spangap-lcd](../spangap-lcd) — the LVGL launcher and `LcdApp` lifecycle the viewer hooks into.
 
 ## Tile baking
 
@@ -112,11 +166,22 @@ in-container orchestrator.
 Copy the resulting tree to your SD card under `maps/` and the device
 picks it up.
 
+### Sizing & licensing
+
+You bound storage by bbox + zoom range, not by tiling the planet, so a city
+across the zooms you actually use is comfortable on an SD card. As a rule of
+thumb a city to z16 runs a few hundred MB of JPEG; each further zoom level is
+roughly ×4 the tiles and disk (z18 ≈ 16× a z16 set), so **z16 is a sane cap for
+a handheld**. Raw `.bin` trades ~7–13× the size for zero on-device decode.
+
+OSM data is **ODbL**: redistributing the baked tiles (or a derived street
+index) carries the "© OpenStreetMap contributors" attribution and the
+share-alike terms. The tiles are free to use — that's just the obligation that
+rides along.
+
 ## Read next
 
 - [INTERNALS.md](INTERNALS.md) — tile format, worker/lcd split,
   on-device controls + zoom capping, cache policy, and the `tilebake`
   bake pipeline (per-map polygon-clipped vector render → one multi-source
   tileserver-gl pass → maketiles, with the per-map vector cache).
-- The consuming-app doc:
-  [docs/maps.md](../hw-tdeck/docs/maps.md).

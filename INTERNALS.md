@@ -1,5 +1,11 @@
 # maps — internals
 
+Maintainer reference for the on-device viewer and the `tilebake` pipeline. The
+[README](README.md) is the operator guide. The desktop-renders / device-blits
+division and the raw-tile idea follow
+[`esp32_offline_osm`](https://github.com/mryndzionek/esp32_offline_osm); the
+device code, the LVGL compositor, and `tilebake` are original to this straddle.
+
 ## Tile format
 
 `/<z>/<x>/<y>` standard slippy-map tiles, 256×256, in one of two encodings;
@@ -9,8 +15,12 @@ the worker tries them in order:
   Decoded on the worker via `esp_jpeg` (TJpgDec). **Baseline only** —
   progressive / arithmetic / CMYK / 12-bit JPEGs are rejected by the decoder.
 - **`.bin`** — raw little-endian RGB565, exactly `256*256*2 = 131072` bytes, no
-  header. LVGL's native canvas order (byte-swapped for the ST7789 on flush).
-  Bigger on disk but zero-decode; the fallback when no `.jpg` is present.
+  header. LVGL's native canvas order (byte-swapped for the ST7789 on flush —
+  `esp32_offline_osm` instead stores its raw tiles in the panel's direct byte
+  order for a straight-to-panel path; this viewer matches the LVGL canvas and
+  lets the flush path do the swap, and tells the JPEG decoder to emit
+  little-endian too). Bigger on disk but zero-decode; the fallback when no `.jpg`
+  is present.
 
 Slippy coords are **global**: tile `(z, x, y)` is the same geographic square no
 matter which source produced it. The device just reads whatever tile is at that
@@ -42,11 +52,19 @@ recentre, zoom-step) pass lcd→worker under `s_ctrlMux`.
 
 ## On-device controls
 
-- **Follow / pan** — follows the GPS fix; a drag (touch or trackball-press)
-  free-pans and unlocks follow; the bottom-right "centre me" button re-locks.
+- **Follow / pan** — follows the GPS fix; a drag free-pans and unlocks follow;
+  the bottom-right "centre me" button re-locks. Two input paths feed the same pan
+  accumulator: a finger/trackball-press drag on the canvas (`mapPressCb` on
+  `LV_EVENT_PRESSING`, using the indev movement vector), and a trackball edge-pan
+  (`lcdProgramScrollHandler` → `mapsScrollCb`) where the lcd component hands over a
+  delta when the cursor is driven into a screen edge — so a touchless deck pans
+  too, even though the canvas isn't an LVGL scroll container.
 - **Zoom** — pinch (two-finger; live-scales the canvas for feedback, then steps
   the zoom by the nearest power-of-two of the pinch ratio on release) **and**
-  grey `+`/`−` buttons bottom-left. Both post a step to the worker.
+  grey `+`/`−` buttons bottom-left. The buttons post a *relative* step to the
+  worker (`s_zoomReq`); pinch instead writes the new *absolute* level straight to
+  `s.maps.zoom`, which the worker observes via its `s.maps` subscription. Either
+  way the worker re-clamps the result to where real tiles exist (below).
 - **Zoom capped to available data** — the worker only changes to a zoom where a
   real (non-overzoom) tile exists at the view centre (`realTileAt`, a cache hit
   or an `fs_stat`). So you can't zoom in past where the SD actually has detail;
@@ -56,8 +74,9 @@ recentre, zoom-step) pass lcd→worker under `s_ctrlMux`.
   flashes for 2 s on any effective-zoom change (button, pinch, or auto-zoom-out),
   hidden by a one-shot LVGL timer.
 - **Overzoom fallback** — a tile missing at the display zoom is filled by
-  upscaling the nearest existing lower-zoom ancestor, so a coarse base "shows
-  through" instead of going grey (also how the bake's edge-dropped tiles render).
+  upscaling the nearest existing lower-zoom ancestor (searched up to 6 levels up,
+  `MAPS_MAXK`), so a coarse base "shows through" instead of going grey (also how
+  the bake's edge-dropped tiles render).
 
 ## GPS as ephemeral storage
 
@@ -97,12 +116,17 @@ rather than a blurry raster upscale. See [§ Combine](#combine--one-render-over-
 - **planetiler** turns each pbf into an OMT-schema vector `.mbtiles`. It
   auto-downloads Natural Earth + water polygons once (~1 GB, cached under
   `.tilebake-cache/data`, then offline). `--bounds` = the map's bbox.
-  - `--maxzoom` is the requested ceiling, so the whole pipeline renders natively
-    at the selected zoom (no overzoom). Caveat from the data, not the tool:
-    planetiler/OpenMapTiles cap vector zoom around **z15**, and OSM-via-OMT
-    carries no real map detail above **~z14** — so a higher ceiling may be
-    rejected by planetiler, and where it isn't it only yields *larger* tiles, not
-    *more* detail (the deepest meaningful zoom is the data's, ~z14).
+  - `--maxzoom` is the vector ceiling planetiler stores, **hard-capped at 16**
+    (planetiler errors above that). A folder ceiling above z16 is still honoured
+    for the *device* tiles: only what planetiler stores is clamped to 16, and the
+    combine bake overzooms those z16 vectors up to the requested ceiling
+    (tileserver-gl serves above a vector source's maxzoom natively), so the device
+    tree still reaches the requested zoom — the same overzoom mechanism as the
+    cross-border show-through. Caveat from the data, not the tool:
+    planetiler/OpenMapTiles cap useful vector zoom around **z15** and OSM-via-OMT
+    carries no real map detail above **~z14**, so a ceiling past there only yields
+    *larger* tiles, not *more* detail (the deepest meaningful zoom is the data's,
+    ~z14).
   - We deliberately set **no `--minzoom`** (always render from z0). A vector
     source with a *non-zero* minzoom renders **blank** at exactly that bottom
     level in tileserver-gl/MapLibre (no parent tile to compose it from), which

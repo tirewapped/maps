@@ -1,4 +1,4 @@
-description: "maps: offline RGB565 slippy-map viewer (LCD launcher program + browser MapWindow). Reads GPS fix via ephemeral storage."
+description: "maps: offline slippy-map viewer — an LCD launcher program that blits pre-baked tiles (JPEG, raw .bin fallback) from SD, centred on the live GPS fix read via ephemeral storage."
 url: https://github.com/reticulous/maps
 version: "0.1.0"
 license: "Apache-2.0"
