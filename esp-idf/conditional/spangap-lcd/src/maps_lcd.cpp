@@ -39,6 +39,7 @@
 
 #include "lcd.h"          /* pulls in lvgl.h */
 #include "lcd_app.h"      /* LcdApp + lcdInstall */
+#include "maps_app.h"     /* MapsApp — this straddle's services: class */
 #include "fs.h"
 #include "storage.h"
 
@@ -654,29 +655,30 @@ static void mapsBuild(lv_obj_t* layer) {
     if (!s_gestureHooked) { lcdTouchAddGestureHandler(mapsGesture); s_gestureHooked = true; }
 }
 
-/* MapsApp — the launcher program as an LcdApp. onCreate builds the canvas once;
- * onShow (re)arms multi-touch + the render worker on every open; onClose tears
- * the canvas down so a later reopen rebuilds (the old static-pointer reopen
- * shortcut dangled after the layer was deleted, hanging the render worker). */
-namespace {
-class MapsApp : public LcdApp {
-public:
-    MapsApp() : LcdApp({ .name = "Maps", .iconBasename = "maps" }) {}
-    void onCreate(lv_obj_t* root) override { mapsBuild(root); }
-    void onShow() override {
-        storageSet("tdeck.multi_touch", 1);   /* pinch gestures while open */
-        s_open = true; wakeWorker();
-    }
-    void onClose() override {
-        s_open = false;
-        storageSet("tdeck.multi_touch", 0);
-        if (s_zoomHideTimer) { lv_timer_delete(s_zoomHideTimer); s_zoomHideTimer = nullptr; }
-        s_canvas = nullptr; s_label = nullptr;
-        s_zoomWidget = nullptr; s_zoomLabel = nullptr;
-        if (s_canvasBuf) { free(s_canvasBuf); s_canvasBuf = nullptr; }
-    }
-};
-}  // namespace
+/* MapsApp — the launcher program as an LcdApp (and thus a Service). onCreate
+ * builds the canvas once; onShow (re)arms multi-touch + the render worker on
+ * every open; onClose tears the canvas down so a later reopen rebuilds (the old
+ * static-pointer reopen shortcut dangled after the layer was deleted, hanging
+ * the render worker). Declared in maps_app.h (global, so the generated
+ * services: trampoline can `new` it); defined here where the file-static viewer
+ * state lives. */
+MapsApp::MapsApp() : LcdApp({ .name = "Maps", .iconBasename = "maps" }) {}
+
+void MapsApp::onCreate(lv_obj_t* root) { mapsBuild(root); }
+
+void MapsApp::onShow() {
+    storageSet("tdeck.multi_touch", 1);   /* pinch gestures while open */
+    s_open = true; wakeWorker();
+}
+
+void MapsApp::onClose() {
+    s_open = false;
+    storageSet("tdeck.multi_touch", 0);
+    if (s_zoomHideTimer) { lv_timer_delete(s_zoomHideTimer); s_zoomHideTimer = nullptr; }
+    s_canvas = nullptr; s_label = nullptr;
+    s_zoomWidget = nullptr; s_zoomLabel = nullptr;
+    if (s_canvasBuf) { free(s_canvasBuf); s_canvasBuf = nullptr; }
+}
 
 /* ─────────────── CLI + settings ─────────────── */
 
@@ -699,28 +701,20 @@ static void cliMaps(const char* args) {
     if (s_haveView)   cliPrintf("view:    %.6f, %.6f\n", s_viewLat, s_viewLon);
 }
 
-/* ─────────────── init ─────────────── */
+/* ─────────────── boot-task wiring (appInit) ─────────────── */
 
-/* Register the maps program — a when:-gated init: hook (spangap/spangap-lcd).
- * This whole file lives under conditional/spangap-lcd/, compiled only when the
- * lcd straddle is staged, so no #if is needed. Plain C++ linkage to match the
- * generated dispatcher's forward decl.
- *
- * Everything maps does is the LCD viewer — the render worker exists only to feed
- * the canvas, the CLI verb reports map state — so all of it is gated behind this
- * hook. Without lcd staged the hook is simply never called (matching the old
- * no-op mapsInit in non-LCD builds). Storage defaults and the Settings pane are
- * generated from the settings: block in straddle.yaml, not registered here. */
-void mapsLcdRegister(void) {
+/* MapsApp::appInit — the boot-task half of bring-up, run once by
+ * LcdApp::onInit() right after it hops the launcher-tile install onto the lcd
+ * task. This whole file lives under conditional/spangap-lcd/, compiled only when
+ * the lcd straddle is staged, so no #if is needed — no lcd, no MapsApp, no
+ * services: registration (matching the old no-op mapsInit in non-LCD builds).
+ * Storage defaults and the Settings pane are generated from the settings: block
+ * in straddle.yaml, not wired here. */
+void MapsApp::appInit() {
     /* GPS is the board's call, not ours: hw-tdeck defaults s.gps.enable on (it
      * has the hardware), and the user owns it thereafter. Forcing it on at every
      * maps init clobbered that choice on every boot. */
     s_mux = xSemaphoreCreateMutex();
     cliRegisterCmd("maps", cliMaps);
     s_worker = spawnTask(mapsWorker, TAG, 8192, nullptr, 1, 1, STACK_PSRAM);
-
-    /* Self-register the launcher program. The launcher entry is read when the
-     * grid is built, on the lcd task after lcdInit, so registering here — from
-     * spangapInitStraddles(), before lcdInit — is fine. */
-    lcdRun([](void*) { lcdInstall(new MapsApp()); });   /* tile build is LVGL: on the lcd task */
 }

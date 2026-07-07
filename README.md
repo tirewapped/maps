@@ -47,10 +47,11 @@ This is an on-device viewer only — there is no browser UI.
 ## How others use it
 
 Include `reticulous/maps` in an LCD build and a **Maps** tile appears in the
-launcher. There is nothing to call: `mapsInit()` is a no-op, and the viewer
-(render worker, CLI verb, Settings pane, launcher app) is brought up
-automatically by the build's generated init through `mapsLcdRegister` — a hook
-compiled in and run only when the `spangap-lcd` straddle is staged. In a
+launcher. There is nothing to call: the viewer is a single `services:` entry
+(`MapsApp`, an `LcdApp`), so the build's generated boot registration constructs
+it, installs its launcher tile, and runs its boot wiring (render worker, CLI
+verb, cache mutex) in `MapsApp::appInit()`. The entry is `when:`-gated on
+`spangap-lcd`, so the whole viewer compiles only when the shell is staged; in a
 non-LCD build there is no map.
 
 The map reads its tiles from SD at the default path

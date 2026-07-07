@@ -5,15 +5,14 @@
  * card (default /sdcard/maps/<z>/<x>/<y>.jpg, raw .bin fallback), centred on
  * the live GPS fix (gps.* ephemeral vars) with a position marker. Tiles are
  * baked on a computer with the tilebake toolchain — nothing is rendered or
- * fetched on the device. The viewer lives in the LCD slice (conditional/spangap-lcd/) and
- * registers via the when:-gated mapsLcdRegister hook; mapsInit() is a no-op.
+ * fetched on the device. The viewer lives in the LCD slice
+ * (conditional/spangap-lcd/) and is brought up as the MapsApp `services:` entry
+ * (straddle.yaml), when:-gated on spangap-lcd.
  *
  * Config:    s.maps.zoom (slippy zoom), s.maps.tiledir (SD path)
  * Ephemeral: maps.state
  */
 #pragma once
-/* mapsInit() is the straddle's `init:` hook (see straddle.yaml) — the generated
- * spangapInitStraddles() dispatcher calls it automatically. It is a no-op: the
- * map viewer (worker task + CLI + storage defaults + LCD launcher) registers via
- * the when:-gated mapsLcdRegister hook in the conditional/spangap-lcd/ slice. */
-void mapsInit(void);          /* no-op; viewer registered by mapsLcdRegister */
+/* No public firmware API: the maps program is the MapsApp Service (see
+ * conditional/spangap-lcd/include/maps_app.h), constructed by the generated
+ * services: trampoline. Nothing outside the straddle calls into maps. */

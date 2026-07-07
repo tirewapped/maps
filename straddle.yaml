@@ -21,19 +21,18 @@ version: 0.0.0
 firmware: esp-idf
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
-# Auto-init: folded into the buildable's generated spangapInitStraddles().
-# mapsInit() is a no-op; mapsLcdRegister() (the when:-gated hook below) registers
-# a CLI verb, spawns the render worker, and self-registers the LCD launcher
-# program. The launcher registration (lcdInstall) is NOT lazy — it posts to the
-# lcd task and bails if that task doesn't exist yet — but the platform band brings
-# lcd up before the straddle band, so by the time the hook runs the lcd task is
-# guaranteed live. (GPS position arrives via storageSubscribeChanges on
-# gps.lat/gps.lon — event-driven, no ordering dependency on any GNSS init.)
-# Storage defaults + the Settings pane are generated from the settings: block.
-init:
-  - call: mapsInit
-  - call: mapsLcdRegister
-    when: spangap/spangap-lcd
+# The maps program is a boot-registered Service: MapsApp is an LcdApp, so this
+# one services: entry installs its launcher tile (LcdApp::onInit) and does its
+# boot wiring (MapsApp::appInit — CLI verb, render worker, cache mutex). It is
+# when:-gated on spangap-lcd — without the lcd straddle staged there is no
+# viewer, so neither the trampoline nor the MapsApp class compiles (the whole
+# class lives under conditional/spangap-lcd/). The platform band brings lcd up
+# before the straddle band, so the tile-install hop always has a live lcd task.
+# (GPS position arrives via storageSubscribeChanges on gps.lat/gps.lon —
+# event-driven, no ordering dependency on any GNSS init.) Storage defaults + the
+# Settings pane are generated from the settings: block below.
+services:
+  - { class: MapsApp, header: maps_app.h, when: spangap/spangap-lcd }
 
 # Declarative settings: the single source for the Maps pane (LCD + web) and its
 # storage defaults. zoom 1..19 (slippy levels); maps.state is ephemeral, shown
