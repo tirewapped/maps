@@ -3,7 +3,7 @@
 # An LCD launcher program that blits pre-baked map tiles read from SD
 # (default /sdcard/maps/<z>/<x>/<y>.jpg, raw .bin fallback) centred on the
 # live GPS fix. Reads the fix via ephemeral gps.* keys — no compile-time GPS
-# dep, so the GNSS chip can live in the consuming buildable straddle (hw-tdeck)
+# dep, so the GNSS chip can live in the consuming buildable straddle (hw-lilygo-tdeck)
 # until a GPS service abstraction earns its own straddle.
 #
 # On-device viewer only — there is no browser UI.

@@ -81,7 +81,7 @@ recentre, zoom-step) pass lcd→worker under `s_ctrlMux`.
 ## GPS as ephemeral storage
 
 The map reads ephemeral `gps.*` keys (no `s.` prefix; lost on reboot, synced
-live). Today they're written by hw-tdeck's `gps.cpp`; any future "GPS service"
+live). Today they're written by hw-lilygo-tdeck's `gps.cpp`; any future "GPS service"
 abstraction just needs to write the same keys.
 
 - `gps.lat` / `gps.lon` — WGS84 degrees (the fix the map centres on)

@@ -58,7 +58,7 @@ The map reads its tiles from SD at the default path
 `/sdcard/maps/<z>/<x>/<y>.jpg` (or `.bin`), 256×256, read on demand and cached
 in PSRAM by the render worker. The GPS fix arrives through ephemeral `gps.*`
 storage keys, so there is no compile-time GPS dependency — the GNSS chip lives
-in the consuming buildable straddle (today hw-tdeck's `gps.cpp`) until a GPS
+in the consuming buildable straddle (today hw-lilygo-tdeck's `gps.cpp`) until a GPS
 service abstraction earns its own straddle.
 
 **Controls:** follows the GPS fix; drag (touch or trackball) to free-pan, the

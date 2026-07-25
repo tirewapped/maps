@@ -711,7 +711,7 @@ static void cliMaps(const char* args) {
  * Storage defaults and the Settings pane are generated from the settings: block
  * in straddle.yaml, not wired here. */
 void MapsApp::appInit() {
-    /* GPS is the board's call, not ours: hw-tdeck defaults s.gps.enable on (it
+    /* GPS is the board's call, not ours: hw-lilygo-tdeck defaults s.gps.enable on (it
      * has the hardware), and the user owns it thereafter. Forcing it on at every
      * maps init clobbered that choice on every boot. */
     s_mux = xSemaphoreCreateMutex();
