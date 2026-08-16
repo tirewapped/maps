@@ -70,7 +70,7 @@ pill flashes for 2 s on each change. See [INTERNALS.md](INTERNALS.md).
 ## Storage variables
 
 Settings live under `s.maps.*` and are owned by the straddle.yaml `settings:`
-block, which generates both the Maps Settings pane (LCD + web) and the storage
+block, which generates both the Settings → Apps → Maps pane (LCD + web) and the storage
 defaults. Runtime state is published under `maps.*`; the GPS fix is read from
 ephemeral `gps.*`.
 

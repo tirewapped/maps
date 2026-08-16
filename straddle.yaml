@@ -39,6 +39,7 @@ services:
 # read-only. Replaces the hand-written mapsSettingsPane + storageDefault trio.
 settings:
   - at:
+      - { id: apps }
       - { id: maps, label: "Maps" }
     rows:
       - section: "Map"
