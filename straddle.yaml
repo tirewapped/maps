@@ -38,7 +38,7 @@ services:
 # storage defaults. zoom 1..19 (slippy levels); maps.state is ephemeral, shown
 # read-only. Replaces the hand-written mapsSettingsPane + storageDefault trio.
 settings:
-  - menu:
+  - at:
       - { id: maps, label: "Maps" }
     rows:
       - section: "Map"
