@@ -94,7 +94,7 @@ ephemeral `gps.*`.
 | `gps.lat` / `gps.lon` | WGS84 degrees — the fix the map centres on. |
 | `gps.sats_view` / `gps.snr` | Satellites in view / best signal, shown on the acquisition screen before a fix. |
 
-While the app is open it sets ephemeral `tdeck.multi_touch` to `1` (and back to
+While the app is open it sets ephemeral `lcd.multi_touch` to `1` (and back to
 `0` on close) so the board reports both fingers for pinch.
 
 ## CLI

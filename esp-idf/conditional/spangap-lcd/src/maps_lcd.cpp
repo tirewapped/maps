@@ -667,13 +667,13 @@ MapsApp::MapsApp() : LcdApp({ .name = "Maps", .iconBasename = "maps" }) {}
 void MapsApp::onCreate(lv_obj_t* root) { mapsBuild(root); }
 
 void MapsApp::onShow() {
-    storageSet("tdeck.multi_touch", 1);   /* pinch gestures while open */
+    storageSet("lcd.multi_touch", 1);   /* pinch gestures while open */
     s_open = true; wakeWorker();
 }
 
 void MapsApp::onClose() {
     s_open = false;
-    storageSet("tdeck.multi_touch", 0);
+    storageSet("lcd.multi_touch", 0);
     if (s_zoomHideTimer) { lv_timer_delete(s_zoomHideTimer); s_zoomHideTimer = nullptr; }
     s_canvas = nullptr; s_label = nullptr;
     s_zoomWidget = nullptr; s_zoomLabel = nullptr;
